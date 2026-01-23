@@ -392,8 +392,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    const bool quant_kv = ggml_is_quantized(K->type) || ggml_is_quantized(V->type);
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (quant_kv) {
+        if (K->ne[0] == 576) {
+            if (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) {
+                return BEST_FATTN_KERNEL_TILE;
+            }
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

@@ -8634,6 +8634,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        // Targeted GLM-4.7 MLA case (gqa_ratio=20, DKQ=576, DV=512)
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 4096, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV));
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
