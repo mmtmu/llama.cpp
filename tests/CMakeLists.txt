@@ -197,6 +197,9 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-server-cache-reuse.cpp)
+target_include_directories(test-server-cache-reuse PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_sources(test-server-cache-reuse PRIVATE ${PROJECT_SOURCE_DIR}/tools/server/server-cache-reuse.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

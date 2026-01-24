@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "server-common.h"
+#include "server-cache-reuse.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -18,6 +19,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <algorithm>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -102,6 +104,14 @@ struct server_slot {
 
     server_prompt prompt;
 
+    struct cache_reuse_state {
+        std::vector<server_cache_reuse_block> blocks;
+        size_t index = 0;
+        bool active = false;
+    };
+
+    cache_reuse_state cache_reuse;
+
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
@@ -168,6 +178,9 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        cache_reuse.blocks.clear();
+        cache_reuse.index = 0;
+        cache_reuse.active = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -454,6 +467,136 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+struct server_cache_reuse_range {
+    size_t start = 0;
+    size_t end   = 0;
+};
+
+static bool server_cache_reuse_range_less(const server_cache_reuse_range & a, const server_cache_reuse_range & b) {
+    if (a.start == b.start) {
+        return a.end < b.end;
+    }
+    return a.start < b.start;
+}
+
+static void server_cache_reuse_add_range(std::vector<server_cache_reuse_range> & ranges, size_t start, size_t end) {
+    if (start >= end) {
+        return;
+    }
+    ranges.push_back(server_cache_reuse_range{ start, end });
+}
+
+static void server_cache_reuse_merge_ranges(std::vector<server_cache_reuse_range> & ranges) {
+    if (ranges.empty()) {
+        return;
+    }
+
+    std::sort(ranges.begin(), ranges.end(), server_cache_reuse_range_less);
+
+    size_t write_idx = 0;
+    for (size_t i = 1; i < ranges.size(); i++) {
+        auto & cur = ranges[write_idx];
+        const auto & next = ranges[i];
+        if (next.start <= cur.end) {
+            if (next.end > cur.end) {
+                cur.end = next.end;
+            }
+        } else {
+            write_idx++;
+            ranges[write_idx] = next;
+        }
+    }
+    ranges.resize(write_idx + 1);
+}
+
+static bool server_cache_reuse_prepare_memory(
+        server_slot & slot,
+        llama_context * ctx,
+        const size_t n_past,
+        const size_t size_old,
+        const size_t size_new) {
+    auto & blocks = slot.cache_reuse.blocks;
+    if (blocks.empty()) {
+        return true;
+    }
+
+    auto * mem = llama_get_memory(ctx);
+    if (!mem) {
+        return false;
+    }
+
+    for (size_t i = blocks.size(); i-- > 0; ) {
+        auto & block = blocks[i];
+        const int64_t shift = (int64_t) block.new_pos - (int64_t) block.old_pos;
+        if (shift <= 0) {
+            continue;
+        }
+
+        const llama_pos p0_dst = (llama_pos) block.new_pos;
+        const llama_pos p1_dst = (llama_pos) (block.new_pos + block.len);
+        const llama_pos p0_src = (llama_pos) block.old_pos;
+        const llama_pos p1_src = (llama_pos) (block.old_pos + block.len);
+
+        if (!llama_memory_seq_rm(mem, slot.id, p0_dst, p1_dst)) {
+            return false;
+        }
+
+        llama_memory_seq_add(mem, slot.id, p0_src, p1_src, (llama_pos) shift);
+        block.pre_shifted = true;
+    }
+
+    std::vector<server_cache_reuse_range> keep_ranges;
+    if (n_past > 0) {
+        server_cache_reuse_add_range(keep_ranges, 0, n_past);
+    }
+
+    for (const auto & block : blocks) {
+        const size_t start = block.pre_shifted ? block.new_pos : block.old_pos;
+        server_cache_reuse_add_range(keep_ranges, start, start + block.len);
+    }
+
+    server_cache_reuse_merge_ranges(keep_ranges);
+
+    size_t pos_max = size_old > size_new ? size_old : size_new;
+    for (const auto & range : keep_ranges) {
+        if (range.end > pos_max) {
+            pos_max = range.end;
+        }
+    }
+
+    size_t cur = n_past;
+    for (const auto & range : keep_ranges) {
+        if (range.end <= cur) {
+            continue;
+        }
+
+        if (range.start > cur) {
+            const llama_pos p0 = (llama_pos) cur;
+            const llama_pos p1 = (llama_pos) std::min(range.start, pos_max);
+            if (p0 < p1 && !llama_memory_seq_rm(mem, slot.id, p0, p1)) {
+                return false;
+            }
+        }
+
+        cur = std::max(cur, range.end);
+        if (cur >= pos_max) {
+            break;
+        }
+    }
+
+    if (cur < pos_max) {
+        if (!llama_memory_seq_rm(mem, slot.id, (llama_pos) cur, (llama_pos) pos_max)) {
+            return false;
+        }
+    }
+
+    if (!llama_memory_seq_rm(mem, slot.id, (llama_pos) pos_max, -1)) {
+        return false;
+    }
+
+    return true;
+}
 
 
 
@@ -2179,6 +2322,13 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        int n_cache_reuse = 0;
+                        bool can_cache_reuse = false;
+                        const size_t prompt_tokens_old_size = slot.prompt.tokens.size();
+
+                        slot.cache_reuse.blocks.clear();
+                        slot.cache_reuse.index = 0;
+                        slot.cache_reuse.active = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -2241,65 +2391,17 @@ private:
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
 
-                                const auto n_cache_reuse = slot.task->params.n_cache_reuse;
+                                n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                const bool can_cache_reuse =
+                                can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    !input_tokens.has_mtmd;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
                                 }
 
-                                // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
-                                    size_t head_c = n_past; // cache
-                                    size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
-                                    }
-
-                                    SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
-
-                                    while (head_c < slot.prompt.tokens.size() &&
-                                           head_p < input_tokens.size()) {
-
-                                        size_t n_match = 0;
-                                        while (head_c + n_match < slot.prompt.tokens.size() &&
-                                               head_p + n_match < input_tokens.size()       &&
-                                               slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
-                                            n_match++;
-                                        }
-
-                                        if (n_match >= (size_t) n_cache_reuse) {
-                                            SLT_INF(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx, prompt_tokens[i]).c_str());
-                                            //}
-
-                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
-
-                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
-                                            llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
-
-                                            for (size_t i = 0; i < n_match; i++) {
-                                                slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
-                                            }
-
-                                            head_c += n_match;
-                                            head_p += n_match;
-                                        } else {
-                                            head_c += 1;
-                                        }
-                                    }
-
-                                    SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
-                                }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
@@ -2426,10 +2528,57 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        slot.n_prompt_tokens_cache = n_past;
+                        if (can_cache_reuse && n_cache_reuse > 0 && n_past < (int) input_tokens.size()) {
+                            size_t new_limit = input_tokens.size();
+                            if (slot.alora_invocation_start > 0) {
+                                new_limit = std::min(new_limit, (size_t) slot.alora_invocation_start);
+                            }
+
+                            if (new_limit > (size_t) n_past) {
+                                const auto & old_tokens = slot.prompt.tokens.get_text_tokens();
+                                const auto & new_tokens = input_tokens.get_text_tokens();
+                                slot.cache_reuse.blocks = server_cache_reuse_build_plan(
+                                        old_tokens,
+                                        new_tokens,
+                                        (size_t) n_past,
+                                        (size_t) n_cache_reuse,
+                                        new_limit);
+                                slot.cache_reuse.active = !slot.cache_reuse.blocks.empty();
+
+                                if (slot.cache_reuse.active) {
+                                    SLT_DBG(slot, "cache reuse plan: %zu blocks (n_past = %d, min = %d)\n",
+                                            slot.cache_reuse.blocks.size(), n_past, n_cache_reuse);
+                                    for (size_t i = 0; i < slot.cache_reuse.blocks.size(); i++) {
+                                        const auto & block = slot.cache_reuse.blocks[i];
+                                        SLT_DBG(slot, "  block %zu: old [%zu, %zu) -> new [%zu, %zu)\n",
+                                                i,
+                                                block.old_pos, block.old_pos + block.len,
+                                                block.new_pos, block.new_pos + block.len);
+                                    }
+                                }
+                            }
+                        }
+
+                        slot.n_prompt_tokens_cache     = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        if (slot.cache_reuse.active) {
+                            if (!server_cache_reuse_prepare_memory(
+                                    slot,
+                                    ctx,
+                                    (size_t) n_past,
+                                    prompt_tokens_old_size,
+                                    input_tokens.size())) {
+                                SLT_WRN(slot, "%s", "cache reuse memory preparation failed - clearing cache\n");
+                                slot.prompt_clear(true);
+                                slot.n_prompt_tokens_cache = 0;
+                                slot.cache_reuse.blocks.clear();
+                                slot.cache_reuse.index = 0;
+                                slot.cache_reuse.active = false;
+                            }
+                        }
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
@@ -2445,18 +2594,20 @@ private:
                         }
                     }
 
-                    // truncate any tokens that are beyond n_past for this slot
-                    const llama_pos p0 = slot.prompt.tokens.pos_next();
+                    if (!slot.cache_reuse.active) {
+                        // truncate any tokens that are beyond n_past for this slot
+                        const llama_pos p0 = slot.prompt.tokens.pos_next();
 
-                    SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                        SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
-                        SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+                        if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                            SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
-                        slot.prompt_clear(true);
+                            slot.prompt_clear(true);
 
-                        // there is no common part left
-                        slot.n_prompt_tokens_cache = 0;
+                            // there is no common part left
+                            slot.n_prompt_tokens_cache = 0;
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -2516,7 +2667,41 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        if (slot.cache_reuse.active && slot.cache_reuse.index < slot.cache_reuse.blocks.size()) {
+                            const auto & block = slot.cache_reuse.blocks[slot.cache_reuse.index];
+                            const size_t cur_pos = slot.prompt.n_tokens();
+
+                            if (cur_pos == block.new_pos) {
+                                const int64_t shift = (int64_t) block.new_pos - (int64_t) block.old_pos;
+
+                                if (!block.pre_shifted && shift != 0) {
+                                    const llama_pos p0_dst = (llama_pos) block.new_pos;
+                                    const llama_pos p0_src = (llama_pos) block.old_pos;
+                                    const llama_pos p1_src = (llama_pos) (block.old_pos + block.len);
+
+                                    llama_memory_seq_rm (llama_get_memory(ctx), slot.id, p0_dst, p0_src);
+                                    llama_memory_seq_add(llama_get_memory(ctx), slot.id, p0_src, p1_src, (llama_pos) shift);
+                                }
+
+                                for (size_t i = 0; i < block.len; i++) {
+                                    slot.prompt.tokens.push_back(input_tokens[block.new_pos + i]);
+                                }
+
+                                slot.n_prompt_tokens_cache += (int32_t) block.len;
+                                slot.cache_reuse.index++;
+                                continue;
+                            } else if (cur_pos > block.new_pos) {
+                                SLT_WRN(slot, "cache reuse plan out of sync (cur_pos = %zu, block.new_pos = %zu) - disabling reuse\n",
+                                        cur_pos, block.new_pos);
+                                slot.cache_reuse.active = false;
+                            }
+                        }
+
+                        if (batch.n_tokens >= n_batch) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

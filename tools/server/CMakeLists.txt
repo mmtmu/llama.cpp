@@ -5,6 +5,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 set(TARGET server-context)
 
 add_library(${TARGET} STATIC
+    server-cache-reuse.cpp
+    server-cache-reuse.h
     server-task.cpp
     server-task.h
     server-queue.cpp
