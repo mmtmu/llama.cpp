@@ -20,6 +20,7 @@
 #include <memory>
 #include <filesystem>
 #include <algorithm>
+#include <limits>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -106,6 +107,7 @@ struct server_slot {
 
     struct cache_reuse_state {
         std::vector<server_cache_reuse_block> blocks;
+        std::vector<std::vector<uint8_t>> stash;
         size_t index = 0;
         bool active = false;
     };
@@ -179,6 +181,7 @@ struct server_slot {
 
         n_prompt_tokens_cache = 0;
         cache_reuse.blocks.clear();
+        cache_reuse.stash.clear();
         cache_reuse.index = 0;
         cache_reuse.active = false;
 
@@ -468,54 +471,10 @@ struct server_slot {
     }
 };
 
-struct server_cache_reuse_range {
-    size_t start = 0;
-    size_t end   = 0;
-};
-
-static bool server_cache_reuse_range_less(const server_cache_reuse_range & a, const server_cache_reuse_range & b) {
-    if (a.start == b.start) {
-        return a.end < b.end;
-    }
-    return a.start < b.start;
-}
-
-static void server_cache_reuse_add_range(std::vector<server_cache_reuse_range> & ranges, size_t start, size_t end) {
-    if (start >= end) {
-        return;
-    }
-    ranges.push_back(server_cache_reuse_range{ start, end });
-}
-
-static void server_cache_reuse_merge_ranges(std::vector<server_cache_reuse_range> & ranges) {
-    if (ranges.empty()) {
-        return;
-    }
-
-    std::sort(ranges.begin(), ranges.end(), server_cache_reuse_range_less);
-
-    size_t write_idx = 0;
-    for (size_t i = 1; i < ranges.size(); i++) {
-        auto & cur = ranges[write_idx];
-        const auto & next = ranges[i];
-        if (next.start <= cur.end) {
-            if (next.end > cur.end) {
-                cur.end = next.end;
-            }
-        } else {
-            write_idx++;
-            ranges[write_idx] = next;
-        }
-    }
-    ranges.resize(write_idx + 1);
-}
-
 static bool server_cache_reuse_prepare_memory(
         server_slot & slot,
         llama_context * ctx,
-        const size_t n_past,
-        const size_t size_old,
-        const size_t size_new) {
+        const size_t n_past) {
     auto & blocks = slot.cache_reuse.blocks;
     if (blocks.empty()) {
         return true;
@@ -526,74 +485,50 @@ static bool server_cache_reuse_prepare_memory(
         return false;
     }
 
-    for (size_t i = blocks.size(); i-- > 0; ) {
-        auto & block = blocks[i];
-        const int64_t shift = (int64_t) block.new_pos - (int64_t) block.old_pos;
-        if (shift <= 0) {
+    std::vector<std::vector<uint8_t>> stash;
+    stash.resize(blocks.size());
+
+    for (size_t i = 0; i < blocks.size(); i++) {
+        const auto & block = blocks[i];
+        if (block.len == 0) {
             continue;
         }
 
-        const llama_pos p0_dst = (llama_pos) block.new_pos;
-        const llama_pos p1_dst = (llama_pos) (block.new_pos + block.len);
-        const llama_pos p0_src = (llama_pos) block.old_pos;
-        const llama_pos p1_src = (llama_pos) (block.old_pos + block.len);
-
-        if (!llama_memory_seq_rm(mem, slot.id, p0_dst, p1_dst)) {
+        const size_t end_pos = block.old_pos + block.len;
+        if (end_pos > (size_t) std::numeric_limits<llama_pos>::max()) {
             return false;
         }
 
-        llama_memory_seq_add(mem, slot.id, p0_src, p1_src, (llama_pos) shift);
-        block.pre_shifted = true;
-    }
+        const llama_pos p0 = (llama_pos) block.old_pos;
+        const llama_pos p1 = (llama_pos) end_pos;
 
-    std::vector<server_cache_reuse_range> keep_ranges;
-    if (n_past > 0) {
-        server_cache_reuse_add_range(keep_ranges, 0, n_past);
-    }
+        const size_t range_size = llama_memory_seq_get_size_range(mem, slot.id, p0, p1);
+        if (range_size == 0) {
+            SLT_WRN(slot, "cache reuse stash failed for block %zu - disabling reuse\n", i);
+            slot.cache_reuse.active = false;
+            slot.cache_reuse.blocks.clear();
+            slot.cache_reuse.stash.clear();
+            return true;
+        }
 
-    for (const auto & block : blocks) {
-        const size_t start = block.pre_shifted ? block.new_pos : block.old_pos;
-        server_cache_reuse_add_range(keep_ranges, start, start + block.len);
-    }
+        stash[i].resize(range_size);
 
-    server_cache_reuse_merge_ranges(keep_ranges);
-
-    size_t pos_max = size_old > size_new ? size_old : size_new;
-    for (const auto & range : keep_ranges) {
-        if (range.end > pos_max) {
-            pos_max = range.end;
+        const size_t range_written = llama_memory_seq_get_data_range(
+                mem, stash[i].data(), range_size, slot.id, p0, p1);
+        if (range_written != range_size) {
+            SLT_WRN(slot, "cache reuse stash failed for block %zu - disabling reuse\n", i);
+            slot.cache_reuse.active = false;
+            slot.cache_reuse.blocks.clear();
+            slot.cache_reuse.stash.clear();
+            return true;
         }
     }
 
-    size_t cur = n_past;
-    for (const auto & range : keep_ranges) {
-        if (range.end <= cur) {
-            continue;
-        }
-
-        if (range.start > cur) {
-            const llama_pos p0 = (llama_pos) cur;
-            const llama_pos p1 = (llama_pos) std::min(range.start, pos_max);
-            if (p0 < p1 && !llama_memory_seq_rm(mem, slot.id, p0, p1)) {
-                return false;
-            }
-        }
-
-        cur = std::max(cur, range.end);
-        if (cur >= pos_max) {
-            break;
-        }
-    }
-
-    if (cur < pos_max) {
-        if (!llama_memory_seq_rm(mem, slot.id, (llama_pos) cur, (llama_pos) pos_max)) {
-            return false;
-        }
-    }
-
-    if (!llama_memory_seq_rm(mem, slot.id, (llama_pos) pos_max, -1)) {
+    if (!llama_memory_seq_rm(mem, slot.id, (llama_pos) n_past, -1)) {
         return false;
     }
+
+    slot.cache_reuse.stash = std::move(stash);
 
     return true;
 }
@@ -2324,9 +2259,8 @@ private:
                         int n_past = 0;
                         int n_cache_reuse = 0;
                         bool can_cache_reuse = false;
-                        const size_t prompt_tokens_old_size = slot.prompt.tokens.size();
-
                         slot.cache_reuse.blocks.clear();
+                        slot.cache_reuse.stash.clear();
                         slot.cache_reuse.index = 0;
                         slot.cache_reuse.active = false;
 
@@ -2568,13 +2502,12 @@ private:
                             if (!server_cache_reuse_prepare_memory(
                                     slot,
                                     ctx,
-                                    (size_t) n_past,
-                                    prompt_tokens_old_size,
-                                    input_tokens.size())) {
+                                    (size_t) n_past)) {
                                 SLT_WRN(slot, "%s", "cache reuse memory preparation failed - clearing cache\n");
                                 slot.prompt_clear(true);
                                 slot.n_prompt_tokens_cache = 0;
                                 slot.cache_reuse.blocks.clear();
+                                slot.cache_reuse.stash.clear();
                                 slot.cache_reuse.index = 0;
                                 slot.cache_reuse.active = false;
                             }
@@ -2673,28 +2606,41 @@ private:
                             const size_t cur_pos = slot.prompt.n_tokens();
 
                             if (cur_pos == block.new_pos) {
-                                const int64_t shift = (int64_t) block.new_pos - (int64_t) block.old_pos;
+                                auto * mem = llama_get_memory(ctx);
+                                bool restored = false;
 
-                                if (!block.pre_shifted && shift != 0) {
-                                    const llama_pos p0_dst = (llama_pos) block.new_pos;
-                                    const llama_pos p0_src = (llama_pos) block.old_pos;
-                                    const llama_pos p1_src = (llama_pos) (block.old_pos + block.len);
+                                if (mem && slot.cache_reuse.index < slot.cache_reuse.stash.size()) {
+                                    const int64_t shift = (int64_t) block.new_pos - (int64_t) block.old_pos;
+                                    const auto & stash = slot.cache_reuse.stash[slot.cache_reuse.index];
 
-                                    llama_memory_seq_rm (llama_get_memory(ctx), slot.id, p0_dst, p0_src);
-                                    llama_memory_seq_add(llama_get_memory(ctx), slot.id, p0_src, p1_src, (llama_pos) shift);
+                                    if (shift >= std::numeric_limits<llama_pos>::min() &&
+                                        shift <= std::numeric_limits<llama_pos>::max() &&
+                                        !stash.empty()) {
+                                        const size_t nset = llama_memory_seq_set_data_range(
+                                                mem, stash.data(), stash.size(), slot.id, (llama_pos) shift);
+                                        restored = nset == stash.size();
+                                    }
                                 }
 
-                                for (size_t i = 0; i < block.len; i++) {
-                                    slot.prompt.tokens.push_back(input_tokens[block.new_pos + i]);
+                                if (restored) {
+                                    for (size_t i = 0; i < block.len; i++) {
+                                        slot.prompt.tokens.push_back(input_tokens[block.new_pos + i]);
+                                    }
+
+                                    slot.n_prompt_tokens_cache += (int32_t) block.len;
+                                    slot.cache_reuse.stash[slot.cache_reuse.index].clear();
+                                    slot.cache_reuse.index++;
+                                    continue;
                                 }
 
-                                slot.n_prompt_tokens_cache += (int32_t) block.len;
-                                slot.cache_reuse.index++;
-                                continue;
+                                SLT_WRN(slot, "%s", "cache reuse restore failed - disabling reuse\n");
+                                slot.cache_reuse.active = false;
+                                slot.cache_reuse.stash.clear();
                             } else if (cur_pos > block.new_pos) {
                                 SLT_WRN(slot, "cache reuse plan out of sync (cur_pos = %zu, block.new_pos = %zu) - disabling reuse\n",
                                         cur_pos, block.new_pos);
                                 slot.cache_reuse.active = false;
+                                slot.cache_reuse.stash.clear();
                             }
                         }
 

@@ -578,6 +578,144 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 }
 
+size_t llama_kv_cache::seq_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        throw std::runtime_error("invalid seq_id");
+    }
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (p0 >= p1) {
+        return 0;
+    }
+
+    const size_t expected = (size_t) (p1 - p0);
+
+    io.write(&n_stream, sizeof(n_stream));
+
+    size_t total_count = 0;
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        cell_ranges_t cr { s, {} };
+
+        uint32_t cell_count = 0;
+
+        const auto & cells = v_cells[s];
+        uint32_t cell_range_begin = cells.size();
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            bool match = !cells.is_empty(i) && cells.seq_has(i, seq_id) && cells.pos_in(i, p0, p1);
+
+            if (match) {
+                ++cell_count;
+                if (cell_range_begin == cells.size()) {
+                    cell_range_begin = i;
+                }
+            } else {
+                if (cell_range_begin != cells.size()) {
+                    cr.data.emplace_back(cell_range_begin, i);
+                    cell_range_begin = cells.size();
+                }
+            }
+        }
+
+        if (cell_range_begin != cells.size()) {
+            cr.data.emplace_back(cell_range_begin, cells.size());
+        }
+
+        io.write(&cell_count, sizeof(cell_count));
+        total_count += cell_count;
+
+        if (cell_count == 0) {
+            continue;
+        }
+
+        state_write_meta(io, cr, seq_id);
+        state_write_data(io, cr);
+    }
+
+    if (expected > 0 && total_count != expected) {
+        throw std::runtime_error("seq_write_range: missing cells");
+    }
+
+    return io.n_bytes();
+}
+
+size_t llama_kv_cache::seq_read_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos pos_shift) {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        throw std::runtime_error("invalid seq_id");
+    }
+
+    uint32_t n_stream_cur;
+    io.read_to(&n_stream_cur, sizeof(n_stream_cur));
+    if (n_stream_cur != n_stream) {
+        throw std::runtime_error("n_stream mismatch");
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        uint32_t cell_count;
+        io.read_to(&cell_count, sizeof(cell_count));
+
+        if (cell_count == 0) {
+            continue;
+        }
+
+        llama_batch_allocr balloc(hparams.n_pos_per_embd());
+        llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
+
+        ubatch.seq_id_unq[0] = seq_id;
+
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            llama_pos pos;
+            uint32_t n_seq_id;
+
+            io.read_to(&pos,      sizeof(pos));
+            io.read_to(&n_seq_id, sizeof(n_seq_id));
+
+            if (n_seq_id != 1) {
+                LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+                return 0;
+            }
+
+            // read and discard stored seq id
+            {
+                llama_seq_id seq_id_src;
+                io.read_to(&seq_id_src, sizeof(seq_id_src));
+            }
+
+            const int64_t pos_new = (int64_t) pos + (int64_t) pos_shift;
+            if (pos_new < 0 || pos_new > std::numeric_limits<llama_pos>::max()) {
+                LLAMA_LOG_ERROR("%s: invalid shifted pos %lld\n", __func__, (long long) pos_new);
+                return 0;
+            }
+
+            ubatch.pos[i]      = (llama_pos) pos_new;
+            ubatch.n_seq_id[i] = 1;
+            ubatch.seq_id[i]   = &seq_id;
+        }
+
+        slot_info sinfo = find_slot(ubatch, false, false);
+        if (sinfo.empty()) {
+            LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
+            return 0;
+        }
+
+        apply_ubatch(sinfo, ubatch);
+
+        if (!state_read_data(io, s, cell_count, sinfo)) {
+            return 0;
+        }
+    }
+
+    return io.n_bytes();
+}
+
 llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -802,7 +940,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
-llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont, bool allow_reuse) const {
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -948,7 +1086,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 //                always insert in the cell with minimum pos
                 bool can_use = cells.is_empty(idx);
 
-                if (!can_use && cells.seq_count(idx) == 1) {
+                if (allow_reuse && !can_use && cells.seq_count(idx) == 1) {
                     const llama_pos pos_cell = cells.pos_get(idx);
 
                     // (disabled) causal mask

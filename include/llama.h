@@ -761,6 +761,33 @@ extern "C" {
                  llama_pos p1,
                        int d);
 
+    // Serialize tokens that belong to the specified sequence and have positions in [p0, p1)
+    // Returns 0 on failure or if unsupported
+    LLAMA_API size_t llama_memory_seq_get_size_range(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Copy the serialized range data into the specified buffer
+    // Returns the number of bytes written, or 0 on failure
+    LLAMA_API size_t llama_memory_seq_get_data_range(
+            llama_memory_t mem,
+                 uint8_t * dst,
+                  size_t   size,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    // Restore a serialized range with a relative position shift applied to all positions
+    // Returns the number of bytes read, or 0 on failure
+    LLAMA_API size_t llama_memory_seq_set_data_range(
+            llama_memory_t mem,
+           const uint8_t * src,
+                  size_t   size,
+              llama_seq_id seq_id,
+                 llama_pos pos_shift);
+
     // Returns the smallest position present in the memory for the specified sequence
     // This is typically non-zero only for SWA caches
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory

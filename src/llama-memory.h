@@ -106,6 +106,23 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    // serialize/restore a positional range for a single sequence
+    // return the number of bytes written/read, or 0 on failure/unsupported
+    virtual size_t seq_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+        GGML_UNUSED(io);
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(p0);
+        GGML_UNUSED(p1);
+        return 0;
+    }
+
+    virtual size_t seq_read_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos pos_shift) {
+        GGML_UNUSED(io);
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(pos_shift);
+        return 0;
+    }
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 

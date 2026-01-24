@@ -3270,6 +3270,63 @@ void llama_memory_seq_div(
     mem->seq_div(seq_id, p0, p1, d);
 }
 
+size_t llama_memory_seq_get_size_range(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return 0;
+    }
+
+    llama_io_write_dummy io;
+    try {
+        return mem->seq_write_range(io, seq_id, p0, p1);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error getting range size: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_memory_seq_get_data_range(
+        llama_memory_t mem,
+             uint8_t * dst,
+              size_t   size,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return 0;
+    }
+
+    llama_io_write_buffer io(dst, size);
+    try {
+        return mem->seq_write_range(io, seq_id, p0, p1);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving range data: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_memory_seq_set_data_range(
+        llama_memory_t mem,
+       const uint8_t * src,
+              size_t   size,
+          llama_seq_id seq_id,
+             llama_pos pos_shift) {
+    if (!mem) {
+        return 0;
+    }
+
+    llama_io_read_buffer io(src, size);
+    try {
+        return mem->seq_read_range(io, seq_id, pos_shift);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error restoring range data: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 llama_pos llama_memory_seq_pos_min(
         llama_memory_t mem,
           llama_seq_id seq_id) {

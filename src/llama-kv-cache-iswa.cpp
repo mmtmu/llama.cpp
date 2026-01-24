@@ -107,6 +107,34 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_swa ->seq_div(seq_id, p0, p1, d);
 }
 
+size_t llama_kv_cache_iswa::seq_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    const size_t n0 = kv_base->seq_write_range(io, seq_id, p0, p1);
+    if (n0 == 0) {
+        return 0;
+    }
+
+    const size_t n1 = kv_swa->seq_write_range(io, seq_id, p0, p1);
+    if (n1 == 0) {
+        return 0;
+    }
+
+    return n1;
+}
+
+size_t llama_kv_cache_iswa::seq_read_range(llama_io_read_i & io, llama_seq_id seq_id, llama_pos pos_shift) {
+    const size_t n0 = kv_base->seq_read_range(io, seq_id, pos_shift);
+    if (n0 == 0) {
+        return 0;
+    }
+
+    const size_t n1 = kv_swa->seq_read_range(io, seq_id, pos_shift);
+    if (n1 == 0) {
+        return 0;
+    }
+
+    return n1;
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);
