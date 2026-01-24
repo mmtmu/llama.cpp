@@ -2606,6 +2606,10 @@ private:
                             const size_t cur_pos = slot.prompt.n_tokens();
 
                             if (cur_pos == block.new_pos) {
+                                if (batch.n_tokens > 0) {
+                                    break;
+                                }
+
                                 auto * mem = llama_get_memory(ctx);
                                 bool restored = false;
 

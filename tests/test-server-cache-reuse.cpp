@@ -38,6 +38,15 @@ int main() {
         assert_block(t, plan[0], 3, 3, 3);
     });
 
+    t.test("prefix replaced, suffix added", [](testing & t) {
+        llama_tokens old_tokens = { 1, 2, 3, 4, 5 };
+        llama_tokens new_tokens = { 9, 3, 4, 5, 6 };
+
+        auto plan = server_cache_reuse_build_plan(old_tokens, new_tokens, 0, 2, new_tokens.size());
+        t.assert_true(plan.size() == 1);
+        assert_block(t, plan[0], 2, 1, 3);
+    });
+
     t.test("repeated chunk chooses earliest", [](testing & t) {
         llama_tokens old_tokens = { 7, 7, 1, 2, 3, 1, 2, 3, 4 };
         llama_tokens new_tokens = { 1, 2, 3 };
