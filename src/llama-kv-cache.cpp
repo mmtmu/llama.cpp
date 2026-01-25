@@ -711,6 +711,15 @@ size_t llama_kv_cache::seq_read_range(llama_io_read_i & io, llama_seq_id seq_id,
         if (!state_read_data(io, s, cell_count, sinfo)) {
             return 0;
         }
+
+        if (pos_shift != 0) {
+            for (size_t si = 0; si < sinfo.n_stream(); ++si) {
+                auto & cells = v_cells[sinfo.strm[si]];
+                for (uint32_t idx : sinfo.idxs[si]) {
+                    cells.shift_add(idx, (llama_pos) pos_shift);
+                }
+            }
+        }
     }
 
     return io.n_bytes();

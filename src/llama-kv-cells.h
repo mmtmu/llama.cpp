@@ -382,6 +382,19 @@ public:
         return shift[i];
     }
 
+    // add a pending shift without changing the position
+    void shift_add(uint32_t i, llama_pos d) {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        if (d == 0) {
+            return;
+        }
+
+        shift[i] += d;
+        has_shift = true;
+    }
+
     // check if a cell is not empty and its position is within [p0, p1)
     bool pos_in(uint32_t i, llama_pos p0, llama_pos p1) const {
         assert(i < pos.size());
