@@ -451,6 +451,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_quant(
     constexpr int cpy_ne = cpy_nb / 4;
     static_assert(J % cpy_ne == 0, "bad J");
     static_assert(type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q8_0, "unsupported quant type");
+    if constexpr (J == 0) {
+        return;
+    }
 
     constexpr dequantize_V_t dequantize = get_dequantize_V<type_KV, half, cpy_ne>();
 
@@ -487,6 +490,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_quant(
     constexpr int cpy_ne = cpy_nb / 4;
     static_assert(J % cpy_ne == 0, "bad J");
     static_assert(type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q8_0, "unsupported quant type");
+    if constexpr (J == 0) {
+        return;
+    }
 
     constexpr dequantize_V_t dequantize = get_dequantize_V<type_KV, float, cpy_ne>();
 
@@ -651,7 +657,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K>(
             Q_tmp, K, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
-    if (nbatch_K_last > 0) {
+    if constexpr (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, type_K>(
             Q_tmp, K, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
