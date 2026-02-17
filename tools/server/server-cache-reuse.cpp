@@ -1,5 +1,6 @@
 #include "server-cache-reuse.h"
 
+#include <algorithm>
 #include <unordered_map>
 
 static uint64_t server_cache_reuse_token_value(const llama_token token) {
@@ -126,4 +127,92 @@ std::vector<server_cache_reuse_block> server_cache_reuse_build_plan(
     }
 
     return plan;
+}
+
+server_cache_reuse_routing_choice server_cache_reuse_select_slot(
+        const std::vector<server_cache_reuse_routing_candidate> & candidates,
+        const llama_tokens & tokens_new,
+        size_t min_match) {
+    server_cache_reuse_routing_choice choice;
+    if (candidates.empty()) {
+        return choice;
+    }
+
+    std::vector<server_cache_reuse_routing_choice> scores(candidates.size());
+    bool has_overlap = false;
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto & candidate = candidates[i];
+        const llama_tokens * old_tokens = candidate.tokens_old;
+        if (!old_tokens || min_match == 0) {
+            continue;
+        }
+
+        const auto plan = server_cache_reuse_build_plan(
+                *old_tokens,
+                tokens_new,
+                0,
+                min_match,
+                tokens_new.size());
+
+        size_t sum_len = 0;
+        size_t max_len = 0;
+        for (const auto & block : plan) {
+            sum_len += block.len;
+            max_len = std::max(max_len, block.len);
+        }
+
+        scores[i].sum_len = sum_len;
+        scores[i].max_len = max_len;
+        has_overlap = has_overlap || (sum_len > 0);
+    }
+
+    if (has_overlap) {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (scores[i].sum_len == 0) {
+                continue;
+            }
+
+            if (choice.candidate_index == std::numeric_limits<size_t>::max()) {
+                choice = scores[i];
+                choice.candidate_index = i;
+                continue;
+            }
+
+            const auto & candidate = candidates[i];
+            const auto & best = candidates[choice.candidate_index];
+            const auto & score = scores[i];
+            const auto & best_score = scores[choice.candidate_index];
+
+            const bool better =
+                    (score.sum_len > best_score.sum_len) ||
+                    (score.sum_len == best_score.sum_len && score.max_len > best_score.max_len) ||
+                    (score.sum_len == best_score.sum_len && score.max_len == best_score.max_len &&
+                        candidate.t_last_used < best.t_last_used) ||
+                    (score.sum_len == best_score.sum_len && score.max_len == best_score.max_len &&
+                        candidate.t_last_used == best.t_last_used && candidate.slot_id < best.slot_id);
+
+            if (better) {
+                choice = score;
+                choice.candidate_index = i;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (choice.candidate_index == std::numeric_limits<size_t>::max()) {
+                choice.candidate_index = i;
+                continue;
+            }
+
+            const auto & candidate = candidates[i];
+            const auto & best = candidates[choice.candidate_index];
+
+            if (candidate.t_last_used < best.t_last_used ||
+                (candidate.t_last_used == best.t_last_used && candidate.slot_id < best.slot_id)) {
+                choice.candidate_index = i;
+            }
+        }
+    }
+
+    return choice;
 }

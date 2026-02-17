@@ -1014,9 +1014,68 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        const int n_cache_reuse = task.params.n_cache_reuse;
+        const bool use_island_routing =
+                n_cache_reuse > 0 &&
+                llama_memory_can_shift(llama_get_memory(ctx)) &&
+                !task.tokens.has_mtmd;
+
+        // auto slot routing: if cache reuse is enabled, route by island overlap score
+        // and only fall back to LRU when no reusable island exists.
+        if (ret == nullptr && use_island_routing) {
+            std::vector<server_slot *> idle_slots;
+            std::vector<server_cache_reuse_routing_candidate> candidates;
+
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
+
+                // keep island routing aligned with cache-reuse support constraints
+                if (slot.prompt.tokens.has_mtmd) {
+                    continue;
+                }
+
+                idle_slots.push_back(&slot);
+                candidates.push_back({
+                    &slot.prompt.tokens.get_text_tokens(),
+                    slot.t_last_used,
+                    slot.id,
+                });
+            }
+
+            const auto choice = server_cache_reuse_select_slot(
+                    candidates,
+                    task.tokens.get_text_tokens(),
+                    (size_t) n_cache_reuse);
+
+            if (choice.candidate_index != std::numeric_limits<size_t>::max()) {
+                ret = idle_slots[choice.candidate_index];
+
+                if (choice.sum_len > 0) {
+                    float f_keep = 0.0f;
+                    const size_t size_old = ret->prompt.tokens.get_text_tokens().size();
+                    if (size_old > 0) {
+                        f_keep = (float) choice.sum_len / size_old;
+                    }
+
+                    SLT_INF(*ret, "selected slot by island overlap, sum_len = %zu, max_len = %zu, min = %d, f_keep = %.3f\n",
+                            choice.sum_len, choice.max_len, n_cache_reuse, f_keep);
+
+                    // if we are about to lose a large portion of the existing context - save it in the prompt cache
+                    if (f_keep < 0.5f) {
+                        update_cache = true;
+                    }
+                } else {
+                    SLT_INF(*ret, "selected slot by LRU fallback (no reusable islands), t_last = %" PRId64 ", min = %d\n",
+                            ret->t_last_used, n_cache_reuse);
+                    update_cache = true;
+                }
+            }
+        }
 
         // find the slot that has at least n% prompt similarity
-        if (ret == nullptr && slot_prompt_similarity != 0.0f) {
+        if (ret == nullptr && !use_island_routing && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
