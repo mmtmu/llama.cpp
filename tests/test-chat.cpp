@@ -2973,6 +2973,14 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     // Format: <minimax:tool_call><invoke name="func"><parameter name="key">value</parameter></invoke></minimax:tool_call>
     {
         auto tst = peg_tester("models/templates/MiniMax-M2.jinja", detailed_debug);
+        // MiniMax prefills "]~b]ai\n<think>\n" in the generation prompt, so the model output
+        // starts inside the reasoning block and must be parsed as forced-open thinking.
+        tst.test("I'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
         tst.test(
                "<minimax:tool_call>\n<invoke name=\"special_function\">\n<parameter "
                "name=\"arg1\">1</parameter>\n</invoke>\n</minimax:tool_call>")

@@ -15,6 +15,42 @@ using json = nlohmann::ordered_json;
 
 namespace {
 
+// Some templates prefill an opening reasoning tag in the generation prompt,
+// so sampling starts inside the reasoning block rather than before it.
+static bool generation_prompt_forces_open_reasoning(const std::string & generation_prompt,
+                                                    const std::string & start,
+                                                    const std::string & end) {
+    if (generation_prompt.empty() || start.empty() || end.empty()) {
+        return false;
+    }
+
+    const size_t last_end = generation_prompt.rfind(end);
+
+    auto leaves_parser_inside_reasoning = [&](const std::string & candidate_start) {
+        if (candidate_start.empty()) {
+            return false;
+        }
+
+        const size_t last_start = generation_prompt.rfind(candidate_start);
+        if (last_start == std::string::npos) {
+            return false;
+        }
+
+        if (last_end != std::string::npos && last_start <= last_end) {
+            return false;
+        }
+
+        return trim_whitespace(generation_prompt.substr(last_start + candidate_start.size())).empty();
+    };
+
+    if (leaves_parser_inside_reasoning(start)) {
+        return true;
+    }
+
+    const std::string trimmed_start = trim_trailing_whitespace(start);
+    return trimmed_start != start && leaves_parser_inside_reasoning(trimmed_start);
+}
+
 // Gemma4-specific PEG builder extending the standard chat builder.
 // Adds value type parsers that use <|\"|> as string delimiters
 // instead of JSON's double quotes, and disables json-to-schema
@@ -189,6 +225,8 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
     return build_chat_peg_parser([&](common_chat_peg_builder & p) {
         parser_build_context ctx(p, inputs);
         bool                 extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+        bool                 reasoning_forced_open = extract_reasoning &&
+            generation_prompt_forces_open_reasoning(inputs.generation_prompt, reasoning.start, reasoning.end);
 
         ctx.extracting_reasoning = extract_reasoning && reasoning.mode != reasoning_mode::NONE;
         ctx.content              = &content;
@@ -216,7 +254,11 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs) cons
         } else {
             parser = content.build_parser(ctx);
         }
-        return pure_content ? p.prefix(inputs.generation_prompt, reasoning.start) + parser : p.prefix(inputs.generation_prompt, reasoning.start) << parser;
+
+        auto generation_prompt =
+            reasoning_forced_open ? p.prefix(inputs.generation_prompt) : p.prefix(inputs.generation_prompt, reasoning.start);
+
+        return pure_content ? generation_prompt + parser : generation_prompt << parser;
     });
 }
 
@@ -227,8 +269,13 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
         return p.eps();
     }
 
+    bool forced_open = generation_prompt_forces_open_reasoning(ctx.inputs.generation_prompt, start, end);
+
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
         if (!end.empty()) {
+            if (forced_open) {
+                return p.optional(p.reasoning(p.until(end)) + end + p.space());
+            }
             if (!start.empty()) {
                 // Standard tag-based: optional(<think>reasoning</think>)
                 return p.optional(start + p.reasoning(p.until(end)) + end + p.space());
@@ -284,6 +331,8 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
     bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    bool         forced_open = ctx.extracting_reasoning && ctx.reasoning &&
+        generation_prompt_forces_open_reasoning(inputs.generation_prompt, ctx.reasoning->start, ctx.reasoning->end);
 
     // Build effective field names with dot notation if function_field is set
     std::string name_field = format.name_field;
@@ -313,14 +362,24 @@ common_peg_parser analyze_tools::build_tool_parser_json_native(parser_build_cont
         tool_start = format.per_call_start;
     }
 
-    return ctx.reasoning_parser + (force_tools ? p.eps() : p.optional(p.content(p.until(tool_start)))) + tools_parser +
-           p.end();
+    auto parser_with_reasoning =
+        ctx.reasoning_parser + (force_tools ? p.eps() : p.optional(p.content(p.until(tool_start)))) + tools_parser +
+        p.end();
+
+    if (forced_open && !tool_start.empty()) {
+        auto direct_tool_calls = p.peek(p.literal(tool_start)) + tools_parser + p.end();
+        return p.choice({ direct_tool_calls, parser_with_reasoning });
+    }
+
+    return parser_with_reasoning;
 }
 
 common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
     bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    bool         forced_open = ctx.extracting_reasoning && ctx.reasoning &&
+        generation_prompt_forces_open_reasoning(inputs.generation_prompt, ctx.reasoning->start, ctx.reasoning->end);
 
     common_peg_parser tool_choice = p.choice();
 
@@ -376,14 +435,24 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + (force_tools ? p.eps() : p.optional(p.content(content_before_tools))) + tool_calls +
-           p.end();
+    auto parser_with_reasoning =
+        ctx.reasoning_parser + (force_tools ? p.eps() : p.optional(p.content(content_before_tools))) + tool_calls +
+        p.end();
+
+    if (forced_open && !trigger_marker.empty()) {
+        auto direct_tool_calls = p.peek(p.literal(trigger_marker)) + tool_calls + p.end();
+        return p.choice({ direct_tool_calls, parser_with_reasoning });
+    }
+
+    return parser_with_reasoning;
 }
 
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
     bool         force_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+    bool         forced_open = ctx.extracting_reasoning && ctx.reasoning &&
+        generation_prompt_forces_open_reasoning(inputs.generation_prompt, ctx.reasoning->start, ctx.reasoning->end);
 
     common_peg_parser tool_choice = p.choice();
 
@@ -532,8 +601,16 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + (force_tools ? p.eps() : p.optional(p.content(content_before_tools))) + tool_calls +
-           p.end();
+    auto parser_with_reasoning =
+        ctx.reasoning_parser + (force_tools ? p.eps() : p.optional(p.content(content_before_tools))) + tool_calls +
+        p.end();
+
+    if (forced_open && !trigger_marker.empty()) {
+        auto direct_tool_calls = p.peek(p.literal(trigger_marker)) + tool_calls + p.end();
+        return p.choice({ direct_tool_calls, parser_with_reasoning });
+    }
+
+    return parser_with_reasoning;
 }
 
 common_peg_parser analyze_tools::build_tool_parser_tag_gemma4_dict(parser_build_context & ctx) const {
