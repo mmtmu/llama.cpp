@@ -252,78 +252,110 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
     const auto dfs = [&](const auto & self,
                          server_cache_reuse_piece_cursor old_cur,
                          server_cache_reuse_piece_cursor new_cur) -> server_cache_reuse_match_result {
-        server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
-        server_cache_reuse_normalize_cursor(pieces_new_raw, new_cur);
-
-        const server_cache_reuse_match_state state {
-            old_cur.tok, old_cur.off, new_cur.tok, new_cur.off
+        struct chain_entry {
+            server_cache_reuse_match_state state;
+            bool at_boundary = false;
         };
 
-        if (auto it = memo.find(state); it != memo.end()) {
-            return it->second;
-        }
+        std::vector<chain_entry> chain;
 
-        auto & result = memo[state];
+        auto finish_chain = [&](server_cache_reuse_match_result result) {
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                server_cache_reuse_match_result cur;
+                if (it->at_boundary) {
+                    cur.ok = true;
+                    cur.best_new_tok = it->state.new_tok;
+                    cur.best_old_tok = it->state.old_tok;
+                    cur.choice = server_cache_reuse_match_result::STOP;
+                }
 
-        if (old_cur.off == 0 && new_cur.off == 0) {
-            result.ok = true;
-            result.best_new_tok = new_cur.tok;
-            result.best_old_tok = old_cur.tok;
-            result.choice = server_cache_reuse_match_result::STOP;
-        }
+                if (is_better(result, cur)) {
+                    cur = result;
+                    cur.choice = server_cache_reuse_match_result::ADVANCE;
+                    cur.skip_resume_tok = std::numeric_limits<size_t>::max();
+                    cur.skip_resume_off = 0;
+                }
 
-        if (old_cur.tok >= tokens_old_raw.size()) {
+                memo[it->state] = cur;
+                result = cur;
+            }
+
             return result;
-        }
+        };
 
-        if (new_cur.tok >= tokens_new_raw.size()) {
-            if (can_skip_reasoning(old_cur, new_cur)) {
-                for (const auto & resume_cur : reasoning_resume_options[old_cur.tok]) {
-                    auto cand = self(self, resume_cur, new_cur);
-                    if (is_better(cand, result)) {
-                        result = cand;
-                        result.choice = server_cache_reuse_match_result::SKIP;
-                        result.skip_resume_tok = resume_cur.tok;
-                        result.skip_resume_off = resume_cur.off;
+        while (true) {
+            server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+            server_cache_reuse_normalize_cursor(pieces_new_raw, new_cur);
+
+            const server_cache_reuse_match_state state {
+                old_cur.tok, old_cur.off, new_cur.tok, new_cur.off
+            };
+
+            if (auto it = memo.find(state); it != memo.end()) {
+                return finish_chain(it->second);
+            }
+
+            const bool at_boundary = old_cur.off == 0 && new_cur.off == 0;
+            server_cache_reuse_match_result result;
+            if (at_boundary) {
+                result.ok = true;
+                result.best_new_tok = new_cur.tok;
+                result.best_old_tok = old_cur.tok;
+                result.choice = server_cache_reuse_match_result::STOP;
+            }
+
+            if (old_cur.tok >= tokens_old_raw.size()) {
+                memo[state] = result;
+                return finish_chain(result);
+            }
+
+            if (new_cur.tok >= tokens_new_raw.size()) {
+                if (can_skip_reasoning(old_cur, new_cur)) {
+                    for (const auto & resume_cur : reasoning_resume_options[old_cur.tok]) {
+                        auto cand = self(self, resume_cur, new_cur);
+                        if (is_better(cand, result)) {
+                            result = cand;
+                            result.choice = server_cache_reuse_match_result::SKIP;
+                            result.skip_resume_tok = resume_cur.tok;
+                            result.skip_resume_off = resume_cur.off;
+                        }
                     }
                 }
+
+                memo[state] = result;
+                return finish_chain(result);
             }
 
-            return result;
-        }
+            const auto & old_piece = pieces_old_raw[old_cur.tok];
+            const auto & new_piece = pieces_new_raw[new_cur.tok];
 
-        const auto & old_piece = pieces_old_raw[old_cur.tok];
-        const auto & new_piece = pieces_new_raw[new_cur.tok];
+            const bool can_advance =
+                    !can_skip_reasoning(old_cur, new_cur) &&
+                    old_cur.off < old_piece.size() &&
+                    new_cur.off < new_piece.size() &&
+                    old_piece[old_cur.off] == new_piece[new_cur.off];
 
-        if (old_cur.off < old_piece.size() &&
-            new_cur.off < new_piece.size() &&
-            old_piece[old_cur.off] == new_piece[new_cur.off]) {
-            auto next_old = old_cur;
-            auto next_new = new_cur;
-            server_cache_reuse_advance_cursor(pieces_old_raw, next_old);
-            server_cache_reuse_advance_cursor(pieces_new_raw, next_new);
-            auto cand = self(self, next_old, next_new);
-            if (is_better(cand, result)) {
-                result = cand;
-                result.choice = server_cache_reuse_match_result::ADVANCE;
-                result.skip_resume_tok = std::numeric_limits<size_t>::max();
-                result.skip_resume_off = 0;
-            }
-        }
-
-        if (can_skip_reasoning(old_cur, new_cur)) {
-            for (const auto & resume_cur : reasoning_resume_options[old_cur.tok]) {
-                auto cand = self(self, resume_cur, new_cur);
-                if (is_better(cand, result)) {
-                    result = cand;
-                    result.choice = server_cache_reuse_match_result::SKIP;
-                    result.skip_resume_tok = resume_cur.tok;
-                    result.skip_resume_off = resume_cur.off;
+            if (!can_advance) {
+                if (can_skip_reasoning(old_cur, new_cur)) {
+                    for (const auto & resume_cur : reasoning_resume_options[old_cur.tok]) {
+                        auto cand = self(self, resume_cur, new_cur);
+                        if (is_better(cand, result)) {
+                            result = cand;
+                            result.choice = server_cache_reuse_match_result::SKIP;
+                            result.skip_resume_tok = resume_cur.tok;
+                            result.skip_resume_off = resume_cur.off;
+                        }
+                    }
                 }
-            }
-        }
 
-        return result;
+                memo[state] = result;
+                return finish_chain(result);
+            }
+
+            chain.push_back({ state, at_boundary });
+            server_cache_reuse_advance_cursor(pieces_old_raw, old_cur);
+            server_cache_reuse_advance_cursor(pieces_new_raw, new_cur);
+        }
     };
 
     std::vector<std::pair<size_t, size_t>> raw_delete_ranges;

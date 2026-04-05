@@ -377,6 +377,57 @@ int main() {
         }
     });
 
+    t.test("reasoning compaction handles long matching prefixes", [](testing & t) {
+        llama_tokens old_raw = { 1 };
+        llama_tokens new_raw = { 1 };
+        std::vector<std::string> pieces_old_raw = { "START" };
+        std::vector<std::string> pieces_new_raw = { "START" };
+
+        constexpr int n_prefix = 20000;
+        for (int i = 0; i < n_prefix; ++i) {
+            old_raw.push_back(10000 + i);
+            new_raw.push_back(10000 + i);
+            pieces_old_raw.push_back(std::string("tok-") + std::to_string(i));
+            pieces_new_raw.push_back(std::string("tok-") + std::to_string(i));
+        }
+
+        old_raw.insert(old_raw.end(), { 10, 50, 10, 200000, 10, 51, 4368, 60 });
+        pieces_old_raw.insert(pieces_old_raw.end(), {
+            "\n", "<think>", "\n", "reason", "\n", "</think>", "\n\n\n", "<tool>",
+        });
+
+        new_raw.insert(new_raw.end(), { 367, 60, 99 });
+        pieces_new_raw.insert(pieces_new_raw.end(), {
+            "\n\n", "<tool>", " tail",
+        });
+
+        std::vector<size_t> old_map(old_raw.size() + 1);
+        for (size_t i = 0; i < old_map.size(); ++i) {
+            old_map[i] = i;
+        }
+
+        server_cache_reuse_reasoning_compaction plan;
+        const bool ok = server_cache_reuse_build_reasoning_compaction_pieces(
+                old_raw,
+                pieces_old_raw,
+                old_raw,
+                pieces_old_raw,
+                old_map,
+                new_raw,
+                pieces_new_raw,
+                { 50 },
+                { 51 },
+                plan);
+
+        t.assert_true(ok);
+        if (!ok) {
+            return;
+        }
+        t.assert_true(plan.raw_prefix_len == new_raw.size() - 1);
+        t.assert_true(plan.cache_prefix_tokens.size() == (size_t) n_prefix + 4);
+        t.assert_true(plan.raw_to_cache_prefix.back() == plan.cache_prefix_tokens.size());
+    });
+
     if (t.failures > 0) {
         return 1;
     }
