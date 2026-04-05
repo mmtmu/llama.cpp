@@ -87,6 +87,7 @@ struct server_cache_reuse_match_result {
         SKIP,
     } choice = STOP;
     size_t skip_resume_tok = std::numeric_limits<size_t>::max();
+    size_t skip_resume_off = 0;
 };
 
 static void server_cache_reuse_normalize_cursor(
@@ -175,6 +176,7 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
         const llama_tokens & reasoning_end,
         server_cache_reuse_reasoning_compaction & plan) {
     plan = {};
+    (void) pieces_old_cache;
 
     if (tokens_old_raw.empty() ||
         tokens_old_cache.empty() ||
@@ -197,7 +199,7 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
     }
 
     std::vector<size_t> reasoning_end_at_start(tokens_old_raw.size(), std::numeric_limits<size_t>::max());
-    std::vector<std::vector<size_t>> reasoning_resume_options(tokens_old_raw.size());
+    std::vector<std::vector<server_cache_reuse_piece_cursor>> reasoning_resume_options(tokens_old_raw.size());
     for (size_t pos = 0; pos < tokens_old_raw.size(); ++pos) {
         size_t end_pos = 0;
         if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, pos, reasoning_start, reasoning_end, end_pos)) {
@@ -205,12 +207,15 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
         }
 
         reasoning_end_at_start[pos] = end_pos;
-        reasoning_resume_options[pos].push_back(end_pos);
+        reasoning_resume_options[pos].push_back({ end_pos, 0 });
 
         size_t resume = end_pos;
         while (resume < pieces_old_raw.size() && server_cache_reuse_is_whitespace_only(pieces_old_raw[resume])) {
+            for (size_t off = 1; off <= pieces_old_raw[resume].size(); ++off) {
+                reasoning_resume_options[pos].push_back({ resume, off });
+            }
             resume++;
-            reasoning_resume_options[pos].push_back(resume);
+            reasoning_resume_options[pos].push_back({ resume, 0 });
         }
     }
 
@@ -273,12 +278,13 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
 
         if (new_cur.tok >= tokens_new_raw.size()) {
             if (can_skip_reasoning(old_cur, new_cur)) {
-                for (const size_t resume_tok : reasoning_resume_options[old_cur.tok]) {
-                    auto cand = self(self, { resume_tok, 0 }, new_cur);
+                for (const auto & resume_cur : reasoning_resume_options[old_cur.tok]) {
+                    auto cand = self(self, resume_cur, new_cur);
                     if (is_better(cand, result)) {
                         result = cand;
                         result.choice = server_cache_reuse_match_result::SKIP;
-                        result.skip_resume_tok = resume_tok;
+                        result.skip_resume_tok = resume_cur.tok;
+                        result.skip_resume_off = resume_cur.off;
                     }
                 }
             }
@@ -301,16 +307,18 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
                 result = cand;
                 result.choice = server_cache_reuse_match_result::ADVANCE;
                 result.skip_resume_tok = std::numeric_limits<size_t>::max();
+                result.skip_resume_off = 0;
             }
         }
 
         if (can_skip_reasoning(old_cur, new_cur)) {
-            for (const size_t resume_tok : reasoning_resume_options[old_cur.tok]) {
-                auto cand = self(self, { resume_tok, 0 }, new_cur);
+            for (const auto & resume_cur : reasoning_resume_options[old_cur.tok]) {
+                auto cand = self(self, resume_cur, new_cur);
                 if (is_better(cand, result)) {
                     result = cand;
                     result.choice = server_cache_reuse_match_result::SKIP;
-                    result.skip_resume_tok = resume_tok;
+                    result.skip_resume_tok = resume_cur.tok;
+                    result.skip_resume_off = resume_cur.off;
                 }
             }
         }
@@ -328,6 +336,8 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
 
     size_t old_stop_tok = 0;
     size_t new_stop_tok = 0;
+    std::vector<size_t> raw_to_old_raw_prefix(tokens_new_raw.size() + 1, 0);
+    raw_to_old_raw_prefix[0] = 0;
 
     while (true) {
         server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
@@ -349,7 +359,7 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
 
         if (it->second.choice == server_cache_reuse_match_result::SKIP) {
             raw_delete_ranges.emplace_back(old_cur.tok, it->second.skip_resume_tok);
-            old_cur = { it->second.skip_resume_tok, 0 };
+            old_cur = { it->second.skip_resume_tok, it->second.skip_resume_off };
             continue;
         }
 
@@ -359,6 +369,10 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
 
         server_cache_reuse_advance_cursor(pieces_old_raw, old_cur);
         server_cache_reuse_advance_cursor(pieces_new_raw, new_cur);
+
+        if (new_cur.off == 0 && new_cur.tok < raw_to_old_raw_prefix.size()) {
+            raw_to_old_raw_prefix[new_cur.tok] = old_cur.tok + (old_cur.off != 0 ? 1 : 0);
+        }
     }
 
     if (raw_delete_ranges.empty()) {
@@ -410,59 +424,42 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
     }
 
     plan.raw_to_cache_prefix.assign(plan.raw_prefix_len + 1, 0);
+    plan.raw_to_cache_prefix[0] = 0;
 
-    server_cache_reuse_piece_cursor raw_prefix_cur;
-    server_cache_reuse_piece_cursor cache_cur;
-    server_cache_reuse_normalize_cursor(pieces_new_raw, raw_prefix_cur);
-    server_cache_reuse_normalize_cursor(pieces_old_cache, cache_cur);
+    size_t deleted_before = 0;
+    size_t delete_idx = 0;
 
-    std::vector<std::string> pieces_cache_prefix;
-    pieces_cache_prefix.reserve(plan.cache_prefix_tokens.size());
-    cache_pos = 0;
-    for (const auto & range : cache_delete_ranges) {
-        if (range.first >= cache_stop_tok) {
-            break;
+    for (size_t raw_tok = 1; raw_tok <= plan.raw_prefix_len; ++raw_tok) {
+        size_t old_raw_prefix = raw_to_old_raw_prefix[raw_tok];
+        old_raw_prefix = std::min(old_raw_prefix, tokens_old_raw.size());
+
+        const size_t old_cache_prefix = raw_to_cache[old_raw_prefix];
+
+        while (delete_idx < cache_delete_ranges.size() &&
+               cache_delete_ranges[delete_idx].second <= old_cache_prefix) {
+            deleted_before += cache_delete_ranges[delete_idx].second - cache_delete_ranges[delete_idx].first;
+            delete_idx++;
         }
-        for (; cache_pos < range.first; ++cache_pos) {
-            pieces_cache_prefix.push_back(pieces_old_cache[cache_pos]);
+
+        size_t deleted_partial = 0;
+        if (delete_idx < cache_delete_ranges.size() &&
+            cache_delete_ranges[delete_idx].first < old_cache_prefix) {
+            deleted_partial = old_cache_prefix - cache_delete_ranges[delete_idx].first;
         }
-        cache_pos = std::min(range.second, cache_stop_tok);
-    }
-    for (; cache_pos < cache_stop_tok; ++cache_pos) {
-        pieces_cache_prefix.push_back(pieces_old_cache[cache_pos]);
-    }
 
-    cache_cur = {};
-    server_cache_reuse_normalize_cursor(pieces_cache_prefix, cache_cur);
-    raw_prefix_cur = {};
-    server_cache_reuse_normalize_cursor(pieces_new_raw, raw_prefix_cur);
-
-    while (raw_prefix_cur.tok < plan.raw_prefix_len) {
-        if (cache_cur.tok >= pieces_cache_prefix.size()) {
+        if (old_cache_prefix < deleted_before + deleted_partial) {
             return false;
         }
 
-        const auto & raw_piece = pieces_new_raw[raw_prefix_cur.tok];
-        const auto & cache_piece = pieces_cache_prefix[cache_cur.tok];
-
-        if (raw_prefix_cur.off >= raw_piece.size() || cache_cur.off >= cache_piece.size()) {
+        const size_t compact_prefix = old_cache_prefix - deleted_before - deleted_partial;
+        if (compact_prefix > plan.cache_prefix_tokens.size()) {
             return false;
         }
 
-        if (raw_piece[raw_prefix_cur.off] != cache_piece[cache_cur.off]) {
-            return false;
-        }
-
-        server_cache_reuse_advance_cursor(pieces_new_raw, raw_prefix_cur);
-        server_cache_reuse_advance_cursor(pieces_cache_prefix, cache_cur);
-
-        if (raw_prefix_cur.off == 0 && raw_prefix_cur.tok <= plan.raw_prefix_len) {
-            plan.raw_to_cache_prefix[raw_prefix_cur.tok] = cache_cur.tok;
-        }
+        plan.raw_to_cache_prefix[raw_tok] = compact_prefix;
     }
 
-    server_cache_reuse_normalize_cursor(pieces_cache_prefix, cache_cur);
-    if (cache_cur.tok != pieces_cache_prefix.size() || cache_cur.off != 0) {
+    if (plan.raw_to_cache_prefix.back() != plan.cache_prefix_tokens.size()) {
         return false;
     }
 

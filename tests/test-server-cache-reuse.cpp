@@ -178,6 +178,9 @@ int main() {
                 plan);
 
         t.assert_true(ok);
+        if (!ok) {
+            return;
+        }
         t.assert_true(plan.raw_prefix_len == 3);
         t.assert_true(plan.cache_prefix_tokens == llama_tokens({ 1, 10, 10, 60 }));
         assert_prefix_map(t, plan.raw_to_cache_prefix, { 0, 1, 3, 4 });
@@ -215,8 +218,46 @@ int main() {
                 plan);
 
         t.assert_true(ok);
+        if (!ok) {
+            return;
+        }
         t.assert_true(plan.raw_prefix_len == 3);
         t.assert_true(plan.cache_prefix_tokens == llama_tokens({ 1, 10, 10, 60 }));
+        assert_prefix_map(t, plan.raw_to_cache_prefix, { 0, 1, 3, 4 });
+    });
+
+    t.test("reasoning compaction keeps oversized cache whitespace seam", [](testing & t) {
+        const llama_tokens old_raw = { 1, 10, 50, 10, 2, 10, 51, 4368, 60 };
+        const std::vector<std::string> pieces_old_raw = {
+            "A", "\n", "<think>", "\n", "reason", "\n", "</think>", "\n\n\n", "<tool>",
+        };
+
+        const llama_tokens new_raw = { 1, 367, 60, 99 };
+        const std::vector<std::string> pieces_new_raw = {
+            "A", "\n\n", "<tool>", " tail",
+        };
+
+        const std::vector<size_t> old_map = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+        server_cache_reuse_reasoning_compaction plan;
+
+        const bool ok = server_cache_reuse_build_reasoning_compaction_pieces(
+                old_raw,
+                pieces_old_raw,
+                old_raw,
+                pieces_old_raw,
+                old_map,
+                new_raw,
+                pieces_new_raw,
+                { 50 },
+                { 51 },
+                plan);
+
+        t.assert_true(ok);
+        if (!ok) {
+            return;
+        }
+        t.assert_true(plan.raw_prefix_len == 3);
+        t.assert_true(plan.cache_prefix_tokens == llama_tokens({ 1, 10, 4368, 60 }));
         assert_prefix_map(t, plan.raw_to_cache_prefix, { 0, 1, 3, 4 });
     });
 
@@ -257,16 +298,16 @@ int main() {
             const llama_token tool_body  = 4000 + i;
 
             // old raw/cache keeps the historical reasoning block
-            old_raw.insert(old_raw.end(), { header_tok, 10, 50, 10, reason_tok, 51, 10, 10, tool_tok, tool_body });
+            old_raw.insert(old_raw.end(), { header_tok, 10, 50, 10, reason_tok, 10, 51, 4368, tool_tok, tool_body });
             pieces_old_raw.insert(pieces_old_raw.end(), {
                 std::string("<ai:") + std::to_string(i) + ">",
                 "\n",
                 "<think>",
                 "\n",
                 std::string("reason-") + std::to_string(i),
+                "\n",
                 "</think>",
-                "\n",
-                "\n",
+                "\n\n\n",
                 "<minimax:tool_call>",
                 std::string("<invoke:") + std::to_string(i) + ">",
             });
@@ -314,6 +355,9 @@ int main() {
                 plan);
 
         t.assert_true(ok);
+        if (!ok) {
+            return;
+        }
         t.assert_true(plan.raw_prefix_len == new_raw.size() - 1);
         t.assert_true(plan.cache_prefix_tokens.size() == 1 + n_sections * 5);
         t.assert_true(plan.raw_to_cache_prefix.size() == plan.raw_prefix_len + 1);
