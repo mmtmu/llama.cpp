@@ -19,6 +19,22 @@ static void assert_prefix_map(testing & t, const std::vector<size_t> & got, cons
     }
 }
 
+static void assert_mapped_block(
+        testing & t,
+        const server_cache_reuse_block & block,
+        size_t old_pos,
+        size_t new_pos,
+        size_t len,
+        size_t old_cache_pos,
+        const llama_tokens & cache_tokens,
+        const std::vector<size_t> & raw_to_cache_delta) {
+    assert_block(t, block, old_pos, new_pos, len);
+    t.assert_true(block.old_cache_pos == old_cache_pos);
+    t.assert_true(block.len_cache == cache_tokens.size());
+    t.assert_true(block.cache_tokens == cache_tokens);
+    assert_prefix_map(t, block.raw_to_cache_delta, raw_to_cache_delta);
+}
+
 int main() {
     testing t;
 
@@ -73,6 +89,37 @@ int main() {
 
         auto plan = server_cache_reuse_build_plan(old_tokens, new_tokens, 0, 4, new_tokens.size());
         t.assert_true(plan.empty());
+    });
+
+    t.test("mapped plan reuses islands across non-identity seams", [](testing & t) {
+        const llama_tokens old_raw   = { 1, 367, 60, 2, 367, 70 };
+        const llama_tokens old_cache = { 1, 10, 10, 60, 2, 10, 10, 70 };
+        const std::vector<size_t> old_map = { 0, 1, 3, 4, 5, 7, 8 };
+        const llama_tokens new_raw   = { 1, 99, 2, 367, 70, 100 };
+
+        const auto plan = server_cache_reuse_build_mapped_plan(
+                old_raw,
+                old_cache,
+                old_map,
+                new_raw,
+                1,
+                3,
+                new_raw.size());
+
+        t.assert_true(plan.size() == 1);
+        if (plan.size() != 1) {
+            return;
+        }
+
+        assert_mapped_block(
+                t,
+                plan[0],
+                3,
+                2,
+                3,
+                4,
+                { 2, 10, 10, 70 },
+                { 0, 1, 3, 4 });
     });
 
     t.test("routing prefers larger island sum over better LCP", [](testing & t) {

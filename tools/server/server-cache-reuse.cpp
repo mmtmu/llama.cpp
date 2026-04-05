@@ -634,7 +634,11 @@ std::vector<server_cache_reuse_block> server_cache_reuse_build_plan(
                     len++;
                 }
 
-                plan.push_back(server_cache_reuse_block{ old_pos, new_pos, len, false });
+                server_cache_reuse_block block;
+                block.old_pos = old_pos;
+                block.new_pos = new_pos;
+                block.len     = len;
+                plan.push_back(std::move(block));
                 old_min = old_pos + len;
                 new_pos += len;
                 matched = true;
@@ -644,6 +648,61 @@ std::vector<server_cache_reuse_block> server_cache_reuse_build_plan(
 
         if (!matched) {
             new_pos++;
+        }
+    }
+
+    return plan;
+}
+
+std::vector<server_cache_reuse_block> server_cache_reuse_build_mapped_plan(
+        const llama_tokens & tokens_old_raw,
+        const llama_tokens & tokens_old_cache,
+        const std::vector<size_t> & old_raw_to_cache_prefix,
+        const llama_tokens & tokens_new_raw,
+        size_t start_pos,
+        size_t min_match,
+        size_t new_limit) {
+    auto plan = server_cache_reuse_build_plan(
+            tokens_old_raw,
+            tokens_new_raw,
+            start_pos,
+            min_match,
+            new_limit);
+
+    std::vector<size_t> raw_to_cache = old_raw_to_cache_prefix;
+    if (raw_to_cache.empty()) {
+        raw_to_cache.resize(tokens_old_raw.size() + 1);
+        for (size_t i = 0; i < raw_to_cache.size(); ++i) {
+            raw_to_cache[i] = i;
+        }
+    }
+
+    if (raw_to_cache.size() != tokens_old_raw.size() + 1) {
+        return {};
+    }
+
+    for (auto & block : plan) {
+        const size_t old_end = block.old_pos + block.len;
+        if (old_end > tokens_old_raw.size()) {
+            return {};
+        }
+
+        const size_t cache_lo = raw_to_cache[block.old_pos];
+        const size_t cache_hi = raw_to_cache[old_end];
+        if (cache_hi < cache_lo || cache_hi > tokens_old_cache.size()) {
+            return {};
+        }
+
+        block.old_cache_pos = cache_lo;
+        block.len_cache = cache_hi - cache_lo;
+        block.cache_tokens.assign(tokens_old_cache.begin() + cache_lo, tokens_old_cache.begin() + cache_hi);
+        block.raw_to_cache_delta.resize(block.len + 1);
+        for (size_t i = 0; i <= block.len; ++i) {
+            const size_t cur_cache = raw_to_cache[block.old_pos + i];
+            if (cur_cache < cache_lo) {
+                return {};
+            }
+            block.raw_to_cache_delta[i] = cur_cache - cache_lo;
         }
     }
 

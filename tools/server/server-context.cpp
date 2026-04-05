@@ -490,16 +490,16 @@ static bool server_cache_reuse_prepare_memory(
 
     for (size_t i = 0; i < blocks.size(); i++) {
         const auto & block = blocks[i];
-        if (block.len == 0) {
+        if (block.len_cache == 0) {
             continue;
         }
 
-        const size_t end_pos = block.old_pos + block.len;
+        const size_t end_pos = block.old_cache_pos + block.len_cache;
         if (end_pos > (size_t) std::numeric_limits<llama_pos>::max()) {
             return false;
         }
 
-        const llama_pos p0 = (llama_pos) block.old_pos;
+        const llama_pos p0 = (llama_pos) block.old_cache_pos;
         const llama_pos p1 = (llama_pos) end_pos;
 
         const size_t range_size = llama_memory_seq_get_size_range(mem, slot.id, p0, p1);
@@ -2432,8 +2432,7 @@ private:
 
                                 can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
-                                    is_text_only &&
-                                    slot.prompt.is_raw_cache_identity();
+                                    is_text_only;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -2576,11 +2575,14 @@ private:
                             }
 
                             if (new_limit > (size_t) n_past) {
-                                const auto & old_tokens = slot.prompt.tokens.get_text_tokens();
-                                const auto & new_tokens = input_tokens.get_text_tokens();
-                                slot.cache_reuse.blocks = server_cache_reuse_build_plan(
-                                        old_tokens,
-                                        new_tokens,
+                                const auto & old_raw_tokens = slot.prompt.get_text_tokens_raw();
+                                const auto & old_cache_tokens = slot.prompt.tokens.get_text_tokens();
+                                const auto & new_raw_tokens = input_tokens.get_text_tokens();
+                                slot.cache_reuse.blocks = server_cache_reuse_build_mapped_plan(
+                                        old_raw_tokens,
+                                        old_cache_tokens,
+                                        slot.prompt.raw_to_cache_prefix,
+                                        new_raw_tokens,
                                         (size_t) n_past,
                                         (size_t) n_cache_reuse,
                                         new_limit);
@@ -2591,10 +2593,11 @@ private:
                                             slot.cache_reuse.blocks.size(), n_past, n_cache_reuse);
                                     for (size_t i = 0; i < slot.cache_reuse.blocks.size(); i++) {
                                         const auto & block = slot.cache_reuse.blocks[i];
-                                        SLT_DBG(slot, "  block %zu: old [%zu, %zu) -> new [%zu, %zu)\n",
+                                        SLT_DBG(slot, "  block %zu: raw old [%zu, %zu) -> raw new [%zu, %zu), cache old [%zu, %zu)\n",
                                                 i,
                                                 block.old_pos, block.old_pos + block.len,
-                                                block.new_pos, block.new_pos + block.len);
+                                                block.new_pos, block.new_pos + block.len,
+                                                block.old_cache_pos, block.old_cache_pos + block.len_cache);
                                     }
                                 }
                             }
@@ -2711,9 +2714,10 @@ private:
                     while (slot.prompt.n_tokens_raw() < (size_t) slot.task->n_tokens()) {
                         if (slot.cache_reuse.active && slot.cache_reuse.index < slot.cache_reuse.blocks.size()) {
                             const auto & block = slot.cache_reuse.blocks[slot.cache_reuse.index];
-                            const size_t cur_pos = slot.prompt.n_tokens();
+                            const size_t cur_raw_pos = slot.prompt.n_tokens_raw();
+                            const size_t cur_cache_pos = slot.prompt.n_tokens();
 
-                            if (cur_pos == block.new_pos) {
+                            if (cur_raw_pos == block.new_pos) {
                                 if (batch.n_tokens > 0) {
                                     break;
                                 }
@@ -2722,7 +2726,7 @@ private:
                                 bool restored = false;
 
                                 if (mem && slot.cache_reuse.index < slot.cache_reuse.stash.size()) {
-                                    const int64_t shift = (int64_t) block.new_pos - (int64_t) block.old_pos;
+                                    const int64_t shift = (int64_t) cur_cache_pos - (int64_t) block.old_cache_pos;
                                     const auto & stash = slot.cache_reuse.stash[slot.cache_reuse.index];
 
                                     if (shift >= std::numeric_limits<llama_pos>::min() &&
@@ -2735,9 +2739,14 @@ private:
                                 }
 
                                 if (restored) {
-                                    for (size_t i = 0; i < block.len; i++) {
-                                        slot.prompt.push_back_text_token(input_tokens[block.new_pos + i]);
-                                    }
+                                    const auto & input_text_tokens = input_tokens.get_text_tokens();
+                                    llama_tokens raw_tokens(
+                                            input_text_tokens.begin() + block.new_pos,
+                                            input_text_tokens.begin() + block.new_pos + block.len);
+                                    slot.prompt.append_text_views(
+                                            block.cache_tokens,
+                                            raw_tokens,
+                                            block.raw_to_cache_delta);
 
                                     slot.n_prompt_tokens_cache += (int32_t) block.len;
                                     slot.cache_reuse.stash[slot.cache_reuse.index].clear();
@@ -2748,9 +2757,9 @@ private:
                                 SLT_WRN(slot, "%s", "cache reuse restore failed - disabling reuse\n");
                                 slot.cache_reuse.active = false;
                                 slot.cache_reuse.stash.clear();
-                            } else if (cur_pos > block.new_pos) {
-                                SLT_WRN(slot, "cache reuse plan out of sync (cur_pos = %zu, block.new_pos = %zu) - disabling reuse\n",
-                                        cur_pos, block.new_pos);
+                            } else if (cur_raw_pos > block.new_pos) {
+                                SLT_WRN(slot, "cache reuse plan out of sync (cur_raw_pos = %zu, block.new_pos = %zu) - disabling reuse\n",
+                                        cur_raw_pos, block.new_pos);
                                 slot.cache_reuse.active = false;
                                 slot.cache_reuse.stash.clear();
                             }

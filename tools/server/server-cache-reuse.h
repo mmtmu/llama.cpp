@@ -11,6 +11,10 @@ struct server_cache_reuse_block {
     size_t old_pos = 0;
     size_t new_pos = 0;
     size_t len     = 0;
+    size_t old_cache_pos = 0;
+    size_t len_cache = 0;
+    llama_tokens cache_tokens;
+    std::vector<size_t> raw_to_cache_delta;
     bool   pre_shifted = false;
 };
 
@@ -23,6 +27,15 @@ struct server_cache_reuse_reasoning_compaction {
 std::vector<server_cache_reuse_block> server_cache_reuse_build_plan(
         const llama_tokens & tokens_old,
         const llama_tokens & tokens_new,
+        size_t start_pos,
+        size_t min_match,
+        size_t new_limit);
+
+std::vector<server_cache_reuse_block> server_cache_reuse_build_mapped_plan(
+        const llama_tokens & tokens_old_raw,
+        const llama_tokens & tokens_old_cache,
+        const std::vector<size_t> & old_raw_to_cache_prefix,
+        const llama_tokens & tokens_new_raw,
         size_t start_pos,
         size_t min_match,
         size_t new_limit);

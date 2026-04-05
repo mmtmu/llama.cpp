@@ -742,6 +742,34 @@ struct server_prompt {
         }
     }
 
+    void append_text_views(
+            const llama_tokens & cache_tokens,
+            const llama_tokens & raw_tokens,
+            const std::vector<size_t> & delta_prefix) {
+        GGML_ASSERT(!tokens.has_mtmd);
+        GGML_ASSERT(delta_prefix.size() == raw_tokens.size() + 1);
+        GGML_ASSERT(!delta_prefix.empty());
+        GGML_ASSERT(delta_prefix.front() == 0);
+        GGML_ASSERT(delta_prefix.back() == cache_tokens.size());
+
+        const size_t cache_base = tokens.size();
+        tokens.insert(cache_tokens);
+
+        if (raw_to_cache_prefix.empty()) {
+            raw_to_cache_prefix.assign(1, cache_base);
+        }
+
+        GGML_ASSERT(raw_to_cache_prefix.back() == cache_base);
+
+        for (const auto tok : raw_tokens) {
+            tokens_raw.push_back(tok);
+        }
+
+        for (size_t i = 1; i < delta_prefix.size(); ++i) {
+            raw_to_cache_prefix.push_back(cache_base + delta_prefix[i]);
+        }
+    }
+
     void sync_raw_with_cache_identity() {
         GGML_ASSERT(!tokens.has_mtmd);
         tokens_raw = tokens.get_text_tokens();
