@@ -242,6 +242,86 @@ int main() {
         t.assert_true(!ok);
     });
 
+    t.test("reasoning compaction handles many interleaved reasoning blocks", [](testing & t) {
+        llama_tokens old_raw = { 1 };
+        llama_tokens new_raw = { 1 };
+        std::vector<std::string> pieces_old_raw = { "START" };
+        std::vector<std::string> pieces_new_raw = { "START" };
+        std::vector<size_t> old_map = { 0 };
+
+        constexpr int n_sections = 15;
+        for (int i = 0; i < n_sections; ++i) {
+            const llama_token header_tok = 1000 + i;
+            const llama_token reason_tok = 2000 + i;
+            const llama_token tool_tok   = 3000 + i;
+            const llama_token tool_body  = 4000 + i;
+
+            // old raw/cache keeps the historical reasoning block
+            old_raw.insert(old_raw.end(), { header_tok, 10, 50, 10, reason_tok, 51, 10, 10, tool_tok, tool_body });
+            pieces_old_raw.insert(pieces_old_raw.end(), {
+                std::string("<ai:") + std::to_string(i) + ">",
+                "\n",
+                "<think>",
+                "\n",
+                std::string("reason-") + std::to_string(i),
+                "</think>",
+                "\n",
+                "\n",
+                "<minimax:tool_call>",
+                std::string("<invoke:") + std::to_string(i) + ">",
+            });
+
+            // new raw drops the reasoning block and retokenizes the seam as a double newline
+            new_raw.insert(new_raw.end(), { header_tok, 367, tool_tok, tool_body });
+            pieces_new_raw.insert(pieces_new_raw.end(), {
+                std::string("<ai:") + std::to_string(i) + ">",
+                "\n\n",
+                "<minimax:tool_call>",
+                std::string("<invoke:") + std::to_string(i) + ">",
+            });
+        }
+
+        new_raw.push_back(9000);
+        pieces_new_raw.push_back("<new-user>");
+
+        old_map.resize(old_raw.size() + 1);
+        for (size_t i = 0; i < old_map.size(); ++i) {
+            old_map[i] = i;
+        }
+
+        server_cache_reuse_reasoning_compaction plan;
+        const bool ok = server_cache_reuse_build_reasoning_compaction_pieces(
+                old_raw,
+                pieces_old_raw,
+                old_raw,
+                pieces_old_raw,
+                old_map,
+                new_raw,
+                pieces_new_raw,
+                { 50 },
+                { 51 },
+                plan);
+
+        t.assert_true(ok);
+        t.assert_true(plan.raw_prefix_len == new_raw.size() - 1);
+        t.assert_true(plan.cache_prefix_tokens.size() == 1 + n_sections * 5);
+        t.assert_true(plan.raw_to_cache_prefix.size() == plan.raw_prefix_len + 1);
+        t.assert_true(plan.raw_to_cache_prefix.front() == 0);
+        t.assert_true(plan.raw_to_cache_prefix.back() == plan.cache_prefix_tokens.size());
+
+        size_t raw_pos = 1;
+        size_t cache_pos = 1;
+        for (int i = 0; i < n_sections; ++i) {
+            t.assert_true(plan.raw_to_cache_prefix[raw_pos + 0] == cache_pos + 0);
+            t.assert_true(plan.raw_to_cache_prefix[raw_pos + 1] == cache_pos + 1);
+            t.assert_true(plan.raw_to_cache_prefix[raw_pos + 2] == cache_pos + 3);
+            t.assert_true(plan.raw_to_cache_prefix[raw_pos + 3] == cache_pos + 4);
+            t.assert_true(plan.raw_to_cache_prefix[raw_pos + 4] == cache_pos + 5);
+            raw_pos += 4;
+            cache_pos += 5;
+        }
+    });
+
     if (t.failures > 0) {
         return 1;
     }

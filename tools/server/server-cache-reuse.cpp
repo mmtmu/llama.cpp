@@ -53,6 +53,35 @@ struct server_cache_reuse_piece_cursor {
     size_t off = 0;
 };
 
+struct server_cache_reuse_match_state {
+    size_t old_tok = 0;
+    size_t old_off = 0;
+    size_t new_tok = 0;
+    size_t new_off = 0;
+
+    bool operator==(const server_cache_reuse_match_state & other) const {
+        return old_tok == other.old_tok &&
+               old_off == other.old_off &&
+               new_tok == other.new_tok &&
+               new_off == other.new_off;
+    }
+};
+
+struct server_cache_reuse_match_state_hash {
+    size_t operator()(const server_cache_reuse_match_state & s) const {
+        size_t h = s.old_tok;
+        h = h * 1315423911u + s.old_off;
+        h = h * 1315423911u + s.new_tok;
+        h = h * 1315423911u + s.new_off;
+        return h;
+    }
+};
+
+struct server_cache_reuse_match_result {
+    bool ok = false;
+    size_t skip_resume_tok = std::numeric_limits<size_t>::max();
+};
+
 static void server_cache_reuse_normalize_cursor(
         const std::vector<std::string> & pieces,
         server_cache_reuse_piece_cursor & cur) {
@@ -76,6 +105,20 @@ static void server_cache_reuse_advance_cursor(
 
     cur.off++;
     server_cache_reuse_normalize_cursor(pieces, cur);
+}
+
+static bool server_cache_reuse_is_whitespace_only(const std::string & piece) {
+    if (piece.empty()) {
+        return false;
+    }
+
+    for (const unsigned char ch : piece) {
+        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static std::vector<std::string> server_cache_reuse_token_pieces(
@@ -146,49 +189,74 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
         return false;
     }
 
-    std::vector<std::pair<size_t, size_t>> raw_delete_ranges;
-
-    server_cache_reuse_piece_cursor old_cur;
-    server_cache_reuse_piece_cursor new_cur;
-    server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
-    server_cache_reuse_normalize_cursor(pieces_new_raw, new_cur);
-
-    while (old_cur.tok < tokens_old_raw.size()) {
-        if (new_cur.tok >= tokens_new_raw.size()) {
-            if (old_cur.off == 0 && server_cache_reuse_match_seq(tokens_old_raw, old_cur.tok, reasoning_start)) {
-                size_t end_pos = 0;
-                if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, old_cur.tok, reasoning_start, reasoning_end, end_pos)) {
-                    return false;
-                }
-                raw_delete_ranges.emplace_back(old_cur.tok, end_pos);
-                old_cur = { end_pos, 0 };
-                server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
-                continue;
-            }
-            return false;
+    std::vector<size_t> reasoning_end_at_start(tokens_old_raw.size(), std::numeric_limits<size_t>::max());
+    std::vector<std::vector<size_t>> reasoning_resume_options(tokens_old_raw.size());
+    for (size_t pos = 0; pos < tokens_old_raw.size(); ++pos) {
+        size_t end_pos = 0;
+        if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, pos, reasoning_start, reasoning_end, end_pos)) {
+            continue;
         }
 
+        reasoning_end_at_start[pos] = end_pos;
+        reasoning_resume_options[pos].push_back(end_pos);
+
+        size_t resume = end_pos;
+        while (resume < pieces_old_raw.size() && server_cache_reuse_is_whitespace_only(pieces_old_raw[resume])) {
+            resume++;
+            reasoning_resume_options[pos].push_back(resume);
+        }
+    }
+
+    std::unordered_map<server_cache_reuse_match_state, server_cache_reuse_match_result, server_cache_reuse_match_state_hash> memo;
+
+    const auto can_skip_reasoning = [&](const server_cache_reuse_piece_cursor & old_cur,
+                                        const server_cache_reuse_piece_cursor & new_cur) {
+        if (old_cur.off != 0 || old_cur.tok >= tokens_old_raw.size()) {
+            return false;
+        }
+        if (reasoning_end_at_start[old_cur.tok] == std::numeric_limits<size_t>::max()) {
+            return false;
+        }
+        if (new_cur.off == 0 && server_cache_reuse_match_seq(tokens_new_raw, new_cur.tok, reasoning_start)) {
+            return false;
+        }
+        return true;
+    };
+
+    const auto dfs = [&](const auto & self,
+                         server_cache_reuse_piece_cursor old_cur,
+                         server_cache_reuse_piece_cursor new_cur) -> bool {
         server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
         server_cache_reuse_normalize_cursor(pieces_new_raw, new_cur);
 
-        if (old_cur.tok >= tokens_old_raw.size()) {
-            break;
-        }
-        if (new_cur.tok >= tokens_new_raw.size()) {
-            continue;
+        const server_cache_reuse_match_state state {
+            old_cur.tok, old_cur.off, new_cur.tok, new_cur.off
+        };
+
+        if (auto it = memo.find(state); it != memo.end()) {
+            return it->second.ok;
         }
 
-        if (old_cur.off == 0 &&
-            server_cache_reuse_match_seq(tokens_old_raw, old_cur.tok, reasoning_start) &&
-            !server_cache_reuse_match_seq(tokens_new_raw, new_cur.tok, reasoning_start)) {
-            size_t end_pos = 0;
-            if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, old_cur.tok, reasoning_start, reasoning_end, end_pos)) {
-                return false;
+        auto & result = memo[state];
+
+        if (old_cur.tok >= tokens_old_raw.size()) {
+            result.ok = (new_cur.off == 0);
+            return result.ok;
+        }
+
+        if (new_cur.tok >= tokens_new_raw.size()) {
+            if (can_skip_reasoning(old_cur, new_cur)) {
+                for (const size_t resume_tok : reasoning_resume_options[old_cur.tok]) {
+                    if (self(self, { resume_tok, 0 }, new_cur)) {
+                        result.ok = true;
+                        result.skip_resume_tok = resume_tok;
+                        return true;
+                    }
+                }
             }
-            raw_delete_ranges.emplace_back(old_cur.tok, end_pos);
-            old_cur = { end_pos, 0 };
-            server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
-            continue;
+
+            result.ok = false;
+            return false;
         }
 
         const auto & old_piece = pieces_old_raw[old_cur.tok];
@@ -197,23 +265,61 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
         if (old_cur.off < old_piece.size() &&
             new_cur.off < new_piece.size() &&
             old_piece[old_cur.off] == new_piece[new_cur.off]) {
-            server_cache_reuse_advance_cursor(pieces_old_raw, old_cur);
-            server_cache_reuse_advance_cursor(pieces_new_raw, new_cur);
-            continue;
-        }
-
-        if (old_cur.off == 0 && server_cache_reuse_match_seq(tokens_old_raw, old_cur.tok, reasoning_start)) {
-            size_t end_pos = 0;
-            if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, old_cur.tok, reasoning_start, reasoning_end, end_pos)) {
-                return false;
+            auto next_old = old_cur;
+            auto next_new = new_cur;
+            server_cache_reuse_advance_cursor(pieces_old_raw, next_old);
+            server_cache_reuse_advance_cursor(pieces_new_raw, next_new);
+            if (self(self, next_old, next_new)) {
+                result.ok = true;
+                return true;
             }
-            raw_delete_ranges.emplace_back(old_cur.tok, end_pos);
-            old_cur = { end_pos, 0 };
-            server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+        }
+
+        if (can_skip_reasoning(old_cur, new_cur)) {
+            for (const size_t resume_tok : reasoning_resume_options[old_cur.tok]) {
+                if (self(self, { resume_tok, 0 }, new_cur)) {
+                    result.ok = true;
+                    result.skip_resume_tok = resume_tok;
+                    return true;
+                }
+            }
+        }
+
+        result.ok = false;
+        return false;
+    };
+
+    std::vector<std::pair<size_t, size_t>> raw_delete_ranges;
+    server_cache_reuse_piece_cursor old_cur;
+    server_cache_reuse_piece_cursor new_cur;
+    if (!dfs(dfs, old_cur, new_cur)) {
+        return false;
+    }
+
+    while (true) {
+        server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+        server_cache_reuse_normalize_cursor(pieces_new_raw, new_cur);
+
+        if (old_cur.tok >= tokens_old_raw.size()) {
+            break;
+        }
+
+        const server_cache_reuse_match_state state {
+            old_cur.tok, old_cur.off, new_cur.tok, new_cur.off
+        };
+        const auto it = memo.find(state);
+        if (it == memo.end() || !it->second.ok) {
+            return false;
+        }
+
+        if (it->second.skip_resume_tok != std::numeric_limits<size_t>::max()) {
+            raw_delete_ranges.emplace_back(old_cur.tok, it->second.skip_resume_tok);
+            old_cur = { it->second.skip_resume_tok, 0 };
             continue;
         }
 
-        return false;
+        server_cache_reuse_advance_cursor(pieces_old_raw, old_cur);
+        server_cache_reuse_advance_cursor(pieces_new_raw, new_cur);
     }
 
     if (raw_delete_ranges.empty() || new_cur.off != 0) {
@@ -221,9 +327,6 @@ bool server_cache_reuse_build_reasoning_compaction_pieces(
     }
 
     plan.raw_prefix_len = new_cur.tok;
-    if (plan.raw_prefix_len == 0) {
-        return false;
-    }
 
     std::vector<std::pair<size_t, size_t>> cache_delete_ranges;
     cache_delete_ranges.reserve(raw_delete_ranges.size());
