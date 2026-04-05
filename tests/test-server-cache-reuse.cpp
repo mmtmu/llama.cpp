@@ -281,6 +281,17 @@ int main() {
             });
         }
 
+        // old cached prompt can include a trailing generated assistant tail from the
+        // previous request that is not part of the new request history.
+        old_raw.insert(old_raw.end(), { 7000, 10, 50, 10, 7100 });
+        pieces_old_raw.insert(pieces_old_raw.end(), {
+            "<gen-assistant>",
+            "\n",
+            "<think>",
+            "\n",
+            "tail-token",
+        });
+
         new_raw.push_back(9000);
         pieces_new_raw.push_back("<new-user>");
 
