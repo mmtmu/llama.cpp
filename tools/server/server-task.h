@@ -574,6 +574,8 @@ struct server_prompt_checkpoint {
 
 struct server_prompt {
     server_tokens tokens;
+    llama_tokens  tokens_raw;
+    std::vector<size_t> raw_to_cache_prefix;
 
     std::vector<uint8_t> data;
 
@@ -593,9 +595,180 @@ struct server_prompt {
         return tokens.size();
     }
 
+    bool has_raw_view() const {
+        return !tokens.has_mtmd;
+    }
+
+    const llama_tokens & get_text_tokens_raw() const {
+        GGML_ASSERT(!tokens.has_mtmd);
+        return tokens_raw;
+    }
+
+    size_t n_tokens_raw() const {
+        return tokens.has_mtmd ? tokens.size() : tokens_raw.size();
+    }
+
+    void init_raw_identity() {
+        if (tokens.has_mtmd) {
+            tokens_raw.clear();
+            raw_to_cache_prefix.clear();
+            return;
+        }
+
+        tokens_raw = tokens.get_text_tokens();
+        raw_to_cache_prefix.resize(tokens_raw.size() + 1);
+        for (size_t i = 0; i < raw_to_cache_prefix.size(); ++i) {
+            raw_to_cache_prefix[i] = i;
+        }
+    }
+
+    void clear_tokens() {
+        tokens.clear();
+        if (tokens.has_mtmd) {
+            tokens_raw.clear();
+            raw_to_cache_prefix.clear();
+        } else {
+            tokens_raw.clear();
+            raw_to_cache_prefix.assign(1, 0);
+        }
+    }
+
+    size_t get_common_prefix_raw(const server_tokens & other) const {
+        if (tokens.has_mtmd || other.has_mtmd) {
+            return tokens.get_common_prefix(other);
+        }
+
+        const auto & other_tokens = other.get_text_tokens();
+        const size_t max_idx = std::min(tokens_raw.size(), other_tokens.size());
+        for (size_t i = 0; i < max_idx; ++i) {
+            if (tokens_raw[i] != other_tokens[i]) {
+                return i;
+            }
+        }
+
+        return max_idx;
+    }
+
+    size_t get_common_prefix_raw(const server_prompt & other) const {
+        if (tokens.has_mtmd || other.tokens.has_mtmd) {
+            return tokens.get_common_prefix(other.tokens);
+        }
+
+        const size_t max_idx = std::min(tokens_raw.size(), other.tokens_raw.size());
+        for (size_t i = 0; i < max_idx; ++i) {
+            if (tokens_raw[i] != other.tokens_raw[i]) {
+                return i;
+            }
+        }
+
+        return max_idx;
+    }
+
+    size_t cache_prefix_for_raw_prefix(size_t raw_prefix) const {
+        if (tokens.has_mtmd) {
+            return std::min(raw_prefix, tokens.size());
+        }
+
+        raw_prefix = std::min(raw_prefix, tokens_raw.size());
+
+        if (raw_to_cache_prefix.empty()) {
+            return raw_prefix;
+        }
+
+        return raw_to_cache_prefix[raw_prefix];
+    }
+
+    bool is_raw_cache_identity() const {
+        if (tokens.has_mtmd) {
+            return true;
+        }
+
+        const auto & cache_tokens = tokens.get_text_tokens();
+        if (tokens_raw.size() != cache_tokens.size() ||
+            raw_to_cache_prefix.size() != tokens_raw.size() + 1) {
+            return false;
+        }
+
+        for (size_t i = 0; i < tokens_raw.size(); ++i) {
+            if (tokens_raw[i] != cache_tokens[i] || raw_to_cache_prefix[i] != i) {
+                return false;
+            }
+        }
+
+        return raw_to_cache_prefix.back() == cache_tokens.size();
+    }
+
+    void keep_first_raw(size_t n_raw) {
+        if (tokens.has_mtmd) {
+            return;
+        }
+
+        n_raw = std::min(n_raw, tokens_raw.size());
+        tokens_raw.resize(n_raw);
+        if (raw_to_cache_prefix.empty()) {
+            raw_to_cache_prefix.resize(n_raw + 1);
+            for (size_t i = 0; i < raw_to_cache_prefix.size(); ++i) {
+                raw_to_cache_prefix[i] = i;
+            }
+        } else {
+            raw_to_cache_prefix.resize(n_raw + 1);
+        }
+    }
+
+    void push_back_text_token(llama_token tok) {
+        GGML_ASSERT(!tokens.has_mtmd);
+
+        tokens.push_back(tok);
+        tokens_raw.push_back(tok);
+
+        if (raw_to_cache_prefix.empty()) {
+            raw_to_cache_prefix.assign(1, 0);
+        }
+
+        raw_to_cache_prefix.push_back(tokens.size());
+    }
+
+    void insert_text_tokens(const llama_tokens & inp_tokens) {
+        GGML_ASSERT(!tokens.has_mtmd);
+
+        tokens.insert(inp_tokens);
+        if (raw_to_cache_prefix.empty()) {
+            raw_to_cache_prefix.assign(1, 0);
+        }
+
+        for (const auto tok : inp_tokens) {
+            tokens_raw.push_back(tok);
+            raw_to_cache_prefix.push_back(raw_to_cache_prefix.back() + 1);
+        }
+    }
+
+    void sync_raw_with_cache_identity() {
+        GGML_ASSERT(!tokens.has_mtmd);
+        tokens_raw = tokens.get_text_tokens();
+        raw_to_cache_prefix.resize(tokens_raw.size() + 1);
+        for (size_t i = 0; i < raw_to_cache_prefix.size(); ++i) {
+            raw_to_cache_prefix[i] = i;
+        }
+    }
+
+    void set_text_views(
+            const llama_tokens & cache_tokens,
+            const llama_tokens & raw_tokens,
+            const std::vector<size_t> & prefix_map) {
+        GGML_ASSERT(!tokens.has_mtmd);
+        GGML_ASSERT(prefix_map.size() == raw_tokens.size() + 1);
+
+        tokens.clear();
+        tokens.insert(cache_tokens);
+        tokens_raw = raw_tokens;
+        raw_to_cache_prefix = prefix_map;
+    }
+
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),
+            tokens_raw,
+            raw_to_cache_prefix,
             data,
             checkpoints
         };

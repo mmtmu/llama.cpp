@@ -8,6 +8,17 @@ static void assert_block(testing & t, const server_cache_reuse_block & block, si
     t.assert_true(block.len     == len);
 }
 
+static void assert_prefix_map(testing & t, const std::vector<size_t> & got, const std::vector<size_t> & expected) {
+    t.assert_true(got.size() == expected.size());
+    if (got.size() != expected.size()) {
+        return;
+    }
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        t.assert_true(got[i] == expected[i]);
+    }
+}
+
 int main() {
     testing t;
 
@@ -135,6 +146,100 @@ int main() {
             const auto choice = server_cache_reuse_select_slot(candidates, new_tokens, 2);
             t.assert_true(choice.candidate_index == 1);
         }
+    });
+
+    t.test("reasoning compaction preserves cache seam tokens", [](testing & t) {
+        const llama_tokens old_raw = { 1, 10, 50, 2, 51, 10, 60 };
+        const std::vector<std::string> pieces_old_raw = {
+            "A", "\n", "<think>", "reason", "</think>", "\n", "<tool>",
+        };
+
+        const llama_tokens old_cache = old_raw;
+        const std::vector<std::string> pieces_old_cache = pieces_old_raw;
+
+        const llama_tokens new_raw = { 1, 367, 60, 99 };
+        const std::vector<std::string> pieces_new_raw = {
+            "A", "\n\n", "<tool>", " tail",
+        };
+
+        const std::vector<size_t> old_map = { 0, 1, 2, 3, 4, 5, 6, 7 };
+        server_cache_reuse_reasoning_compaction plan;
+
+        const bool ok = server_cache_reuse_build_reasoning_compaction_pieces(
+                old_raw,
+                pieces_old_raw,
+                old_cache,
+                pieces_old_cache,
+                old_map,
+                new_raw,
+                pieces_new_raw,
+                { 50 },
+                { 51 },
+                plan);
+
+        t.assert_true(ok);
+        t.assert_true(plan.raw_prefix_len == 3);
+        t.assert_true(plan.cache_prefix_tokens == llama_tokens({ 1, 10, 10, 60 }));
+        assert_prefix_map(t, plan.raw_to_cache_prefix, { 0, 1, 3, 4 });
+    });
+
+    t.test("reasoning compaction reuses existing divergent cache seam", [](testing & t) {
+        const llama_tokens old_raw = { 1, 367, 50, 2, 51, 60 };
+        const std::vector<std::string> pieces_old_raw = {
+            "A", "\n\n", "<think>", "reason", "</think>", "<tool>",
+        };
+
+        const llama_tokens old_cache = { 1, 10, 10, 50, 2, 51, 60 };
+        const std::vector<std::string> pieces_old_cache = {
+            "A", "\n", "\n", "<think>", "reason", "</think>", "<tool>",
+        };
+
+        const llama_tokens new_raw = { 1, 367, 60, 99 };
+        const std::vector<std::string> pieces_new_raw = {
+            "A", "\n\n", "<tool>", " tail",
+        };
+
+        const std::vector<size_t> old_map = { 0, 1, 3, 4, 5, 6, 7 };
+        server_cache_reuse_reasoning_compaction plan;
+
+        const bool ok = server_cache_reuse_build_reasoning_compaction_pieces(
+                old_raw,
+                pieces_old_raw,
+                old_cache,
+                pieces_old_cache,
+                old_map,
+                new_raw,
+                pieces_new_raw,
+                { 50 },
+                { 51 },
+                plan);
+
+        t.assert_true(ok);
+        t.assert_true(plan.raw_prefix_len == 3);
+        t.assert_true(plan.cache_prefix_tokens == llama_tokens({ 1, 10, 10, 60 }));
+        assert_prefix_map(t, plan.raw_to_cache_prefix, { 0, 1, 3, 4 });
+    });
+
+    t.test("reasoning compaction rejects non-reasoning mismatch", [](testing & t) {
+        const llama_tokens old_raw = { 1, 10, 50, 2, 51, 10, 60 };
+        const std::vector<std::string> pieces_old_raw = {
+            "A", "\n", "<think>", "reason", "</think>", "\n", "<tool>",
+        };
+
+        server_cache_reuse_reasoning_compaction plan;
+        const bool ok = server_cache_reuse_build_reasoning_compaction_pieces(
+                old_raw,
+                pieces_old_raw,
+                old_raw,
+                pieces_old_raw,
+                { 0, 1, 2, 3, 4, 5, 6, 7 },
+                { 1, 88, 60 },
+                { "A", "X", "<tool>" },
+                { 50 },
+                { 51 },
+                plan);
+
+        t.assert_true(!ok);
     });
 
     if (t.failures > 0) {

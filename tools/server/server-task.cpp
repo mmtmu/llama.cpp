@@ -1957,9 +1957,9 @@ size_t server_prompt_cache::n_tokens() const {
 server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = it->get_common_prefix_raw(prompt);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cur_lcp_len == (int) prompt.n_tokens_raw()) {
             SRV_WRN("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1967,9 +1967,9 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 
     // next, remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->tokens.get_common_prefix(prompt.tokens);
+        const int len = it->get_common_prefix_raw(prompt);
 
-        if (len == (int) it->tokens.size()) {
+        if (len == (int) it->n_tokens_raw()) {
             SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1998,6 +1998,8 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     auto & cur = states.emplace_back();
     cur = {
         /*.tokens      =*/ prompt.tokens.clone(),
+        /*.tokens_raw  =*/ prompt.tokens_raw,
+        /*.raw_to_cache_prefix =*/ prompt.raw_to_cache_prefix,
         /*.data        =*/ std::move(state_data),
         /*.checkpoints =*/ prompt.checkpoints,
     };
@@ -2006,9 +2008,9 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    const int lcp_best = prompt.get_common_prefix_raw(tokens_new);
 
-    float f_keep_best = float(lcp_best) / prompt.tokens.size();
+    float f_keep_best = prompt.n_tokens_raw() > 0 ? float(lcp_best) / prompt.n_tokens_raw() : 0.0f;
     float sim_best    = float(lcp_best) / tokens_new.size();
 
     SRV_WRN(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
@@ -2017,9 +2019,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const int lcp_cur = it->get_common_prefix_raw(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
+        const float f_keep_cur = it->n_tokens_raw() > 0 ? float(lcp_cur) / it->n_tokens_raw() : 0.0f;
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
         // don't trash large prompts

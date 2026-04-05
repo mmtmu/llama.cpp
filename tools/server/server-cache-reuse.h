@@ -14,12 +14,40 @@ struct server_cache_reuse_block {
     bool   pre_shifted = false;
 };
 
+struct server_cache_reuse_reasoning_compaction {
+    size_t raw_prefix_len = 0;
+    llama_tokens cache_prefix_tokens;
+    std::vector<size_t> raw_to_cache_prefix;
+};
+
 std::vector<server_cache_reuse_block> server_cache_reuse_build_plan(
         const llama_tokens & tokens_old,
         const llama_tokens & tokens_new,
         size_t start_pos,
         size_t min_match,
         size_t new_limit);
+
+bool server_cache_reuse_build_reasoning_compaction(
+        const struct llama_context * ctx,
+        const llama_tokens & tokens_old_raw,
+        const llama_tokens & tokens_old_cache,
+        const std::vector<size_t> & old_raw_to_cache_prefix,
+        const llama_tokens & tokens_new_raw,
+        const llama_tokens & reasoning_start,
+        const llama_tokens & reasoning_end,
+        server_cache_reuse_reasoning_compaction & plan);
+
+bool server_cache_reuse_build_reasoning_compaction_pieces(
+        const llama_tokens & tokens_old_raw,
+        const std::vector<std::string> & pieces_old_raw,
+        const llama_tokens & tokens_old_cache,
+        const std::vector<std::string> & pieces_old_cache,
+        const std::vector<size_t> & old_raw_to_cache_prefix,
+        const llama_tokens & tokens_new_raw,
+        const std::vector<std::string> & pieces_new_raw,
+        const llama_tokens & reasoning_start,
+        const llama_tokens & reasoning_end,
+        server_cache_reuse_reasoning_compaction & plan);
 
 struct server_cache_reuse_routing_candidate {
     const llama_tokens * tokens_old = nullptr;

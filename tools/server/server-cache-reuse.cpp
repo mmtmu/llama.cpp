@@ -1,10 +1,346 @@
 #include "server-cache-reuse.h"
 
+#include "common.h"
+
 #include <algorithm>
 #include <unordered_map>
 
 static uint64_t server_cache_reuse_token_value(const llama_token token) {
     return (uint64_t) (uint32_t) token + 1ull;
+}
+
+static bool server_cache_reuse_match_seq(
+        const llama_tokens & tokens,
+        const size_t pos,
+        const llama_tokens & seq) {
+    if (seq.empty() || pos + seq.size() > tokens.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < seq.size(); ++i) {
+        if (tokens[pos + i] != seq[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool server_cache_reuse_find_reasoning_end(
+        const llama_tokens & tokens,
+        const size_t start_pos,
+        const llama_tokens & reasoning_start,
+        const llama_tokens & reasoning_end,
+        size_t & end_pos) {
+    if (!server_cache_reuse_match_seq(tokens, start_pos, reasoning_start)) {
+        return false;
+    }
+
+    size_t pos = start_pos + reasoning_start.size();
+    while (pos < tokens.size()) {
+        if (server_cache_reuse_match_seq(tokens, pos, reasoning_end)) {
+            end_pos = pos + reasoning_end.size();
+            return true;
+        }
+        ++pos;
+    }
+
+    return false;
+}
+
+struct server_cache_reuse_piece_cursor {
+    size_t tok = 0;
+    size_t off = 0;
+};
+
+static void server_cache_reuse_normalize_cursor(
+        const std::vector<std::string> & pieces,
+        server_cache_reuse_piece_cursor & cur) {
+    while (cur.tok < pieces.size()) {
+        const auto & piece = pieces[cur.tok];
+        if (cur.off < piece.size()) {
+            break;
+        }
+        cur.tok++;
+        cur.off = 0;
+    }
+}
+
+static void server_cache_reuse_advance_cursor(
+        const std::vector<std::string> & pieces,
+        server_cache_reuse_piece_cursor & cur) {
+    server_cache_reuse_normalize_cursor(pieces, cur);
+    if (cur.tok >= pieces.size()) {
+        return;
+    }
+
+    cur.off++;
+    server_cache_reuse_normalize_cursor(pieces, cur);
+}
+
+static std::vector<std::string> server_cache_reuse_token_pieces(
+        const struct llama_context * ctx,
+        const llama_tokens & tokens) {
+    std::vector<std::string> pieces;
+    pieces.reserve(tokens.size());
+    for (const auto token : tokens) {
+        pieces.push_back(common_token_to_piece(ctx, token, true));
+    }
+    return pieces;
+}
+
+static std::vector<std::pair<size_t, size_t>> server_cache_reuse_merge_ranges(
+        std::vector<std::pair<size_t, size_t>> ranges) {
+    if (ranges.empty()) {
+        return ranges;
+    }
+
+    std::sort(ranges.begin(), ranges.end());
+
+    std::vector<std::pair<size_t, size_t>> merged;
+    merged.reserve(ranges.size());
+    merged.push_back(ranges[0]);
+
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        auto & back = merged.back();
+        if (ranges[i].first <= back.second) {
+            back.second = std::max(back.second, ranges[i].second);
+        } else {
+            merged.push_back(ranges[i]);
+        }
+    }
+
+    return merged;
+}
+
+bool server_cache_reuse_build_reasoning_compaction_pieces(
+        const llama_tokens & tokens_old_raw,
+        const std::vector<std::string> & pieces_old_raw,
+        const llama_tokens & tokens_old_cache,
+        const std::vector<std::string> & pieces_old_cache,
+        const std::vector<size_t> & old_raw_to_cache_prefix,
+        const llama_tokens & tokens_new_raw,
+        const std::vector<std::string> & pieces_new_raw,
+        const llama_tokens & reasoning_start,
+        const llama_tokens & reasoning_end,
+        server_cache_reuse_reasoning_compaction & plan) {
+    plan = {};
+
+    if (tokens_old_raw.empty() ||
+        tokens_old_cache.empty() ||
+        tokens_new_raw.empty() ||
+        reasoning_start.empty() ||
+        reasoning_end.empty()) {
+        return false;
+    }
+
+    std::vector<size_t> raw_to_cache = old_raw_to_cache_prefix;
+    if (raw_to_cache.empty()) {
+        raw_to_cache.resize(tokens_old_raw.size() + 1);
+        for (size_t i = 0; i < raw_to_cache.size(); ++i) {
+            raw_to_cache[i] = i;
+        }
+    }
+
+    if (raw_to_cache.size() != tokens_old_raw.size() + 1) {
+        return false;
+    }
+
+    std::vector<std::pair<size_t, size_t>> raw_delete_ranges;
+
+    server_cache_reuse_piece_cursor old_cur;
+    server_cache_reuse_piece_cursor new_cur;
+    server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+    server_cache_reuse_normalize_cursor(pieces_new_raw, new_cur);
+
+    while (old_cur.tok < tokens_old_raw.size()) {
+        if (new_cur.tok >= tokens_new_raw.size()) {
+            if (old_cur.off == 0 && server_cache_reuse_match_seq(tokens_old_raw, old_cur.tok, reasoning_start)) {
+                size_t end_pos = 0;
+                if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, old_cur.tok, reasoning_start, reasoning_end, end_pos)) {
+                    return false;
+                }
+                raw_delete_ranges.emplace_back(old_cur.tok, end_pos);
+                old_cur = { end_pos, 0 };
+                server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+                continue;
+            }
+            return false;
+        }
+
+        server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+        server_cache_reuse_normalize_cursor(pieces_new_raw, new_cur);
+
+        if (old_cur.tok >= tokens_old_raw.size()) {
+            break;
+        }
+        if (new_cur.tok >= tokens_new_raw.size()) {
+            continue;
+        }
+
+        if (old_cur.off == 0 &&
+            server_cache_reuse_match_seq(tokens_old_raw, old_cur.tok, reasoning_start) &&
+            !server_cache_reuse_match_seq(tokens_new_raw, new_cur.tok, reasoning_start)) {
+            size_t end_pos = 0;
+            if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, old_cur.tok, reasoning_start, reasoning_end, end_pos)) {
+                return false;
+            }
+            raw_delete_ranges.emplace_back(old_cur.tok, end_pos);
+            old_cur = { end_pos, 0 };
+            server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+            continue;
+        }
+
+        const auto & old_piece = pieces_old_raw[old_cur.tok];
+        const auto & new_piece = pieces_new_raw[new_cur.tok];
+
+        if (old_cur.off < old_piece.size() &&
+            new_cur.off < new_piece.size() &&
+            old_piece[old_cur.off] == new_piece[new_cur.off]) {
+            server_cache_reuse_advance_cursor(pieces_old_raw, old_cur);
+            server_cache_reuse_advance_cursor(pieces_new_raw, new_cur);
+            continue;
+        }
+
+        if (old_cur.off == 0 && server_cache_reuse_match_seq(tokens_old_raw, old_cur.tok, reasoning_start)) {
+            size_t end_pos = 0;
+            if (!server_cache_reuse_find_reasoning_end(tokens_old_raw, old_cur.tok, reasoning_start, reasoning_end, end_pos)) {
+                return false;
+            }
+            raw_delete_ranges.emplace_back(old_cur.tok, end_pos);
+            old_cur = { end_pos, 0 };
+            server_cache_reuse_normalize_cursor(pieces_old_raw, old_cur);
+            continue;
+        }
+
+        return false;
+    }
+
+    if (raw_delete_ranges.empty() || new_cur.off != 0) {
+        return false;
+    }
+
+    plan.raw_prefix_len = new_cur.tok;
+    if (plan.raw_prefix_len == 0) {
+        return false;
+    }
+
+    std::vector<std::pair<size_t, size_t>> cache_delete_ranges;
+    cache_delete_ranges.reserve(raw_delete_ranges.size());
+    for (const auto & range : raw_delete_ranges) {
+        const size_t cache_lo = raw_to_cache[range.first];
+        const size_t cache_hi = raw_to_cache[range.second];
+        if (cache_hi < cache_lo || cache_hi > tokens_old_cache.size()) {
+            return false;
+        }
+        if (cache_lo < cache_hi) {
+            cache_delete_ranges.emplace_back(cache_lo, cache_hi);
+        }
+    }
+
+    cache_delete_ranges = server_cache_reuse_merge_ranges(std::move(cache_delete_ranges));
+
+    plan.cache_prefix_tokens.reserve(tokens_old_cache.size());
+    size_t cache_pos = 0;
+    for (const auto & range : cache_delete_ranges) {
+        for (; cache_pos < range.first; ++cache_pos) {
+            plan.cache_prefix_tokens.push_back(tokens_old_cache[cache_pos]);
+        }
+        cache_pos = range.second;
+    }
+    for (; cache_pos < tokens_old_cache.size(); ++cache_pos) {
+        plan.cache_prefix_tokens.push_back(tokens_old_cache[cache_pos]);
+    }
+
+    if (plan.cache_prefix_tokens.empty()) {
+        return false;
+    }
+
+    plan.raw_to_cache_prefix.assign(plan.raw_prefix_len + 1, 0);
+
+    server_cache_reuse_piece_cursor raw_prefix_cur;
+    server_cache_reuse_piece_cursor cache_cur;
+    server_cache_reuse_normalize_cursor(pieces_new_raw, raw_prefix_cur);
+    server_cache_reuse_normalize_cursor(pieces_old_cache, cache_cur);
+
+    std::vector<std::string> pieces_cache_prefix;
+    pieces_cache_prefix.reserve(plan.cache_prefix_tokens.size());
+    cache_pos = 0;
+    for (const auto & range : cache_delete_ranges) {
+        for (; cache_pos < range.first; ++cache_pos) {
+            pieces_cache_prefix.push_back(pieces_old_cache[cache_pos]);
+        }
+        cache_pos = range.second;
+    }
+    for (; cache_pos < pieces_old_cache.size(); ++cache_pos) {
+        pieces_cache_prefix.push_back(pieces_old_cache[cache_pos]);
+    }
+
+    cache_cur = {};
+    server_cache_reuse_normalize_cursor(pieces_cache_prefix, cache_cur);
+    raw_prefix_cur = {};
+    server_cache_reuse_normalize_cursor(pieces_new_raw, raw_prefix_cur);
+
+    while (raw_prefix_cur.tok < plan.raw_prefix_len) {
+        if (cache_cur.tok >= pieces_cache_prefix.size()) {
+            return false;
+        }
+
+        const auto & raw_piece = pieces_new_raw[raw_prefix_cur.tok];
+        const auto & cache_piece = pieces_cache_prefix[cache_cur.tok];
+
+        if (raw_prefix_cur.off >= raw_piece.size() || cache_cur.off >= cache_piece.size()) {
+            return false;
+        }
+
+        if (raw_piece[raw_prefix_cur.off] != cache_piece[cache_cur.off]) {
+            return false;
+        }
+
+        server_cache_reuse_advance_cursor(pieces_new_raw, raw_prefix_cur);
+        server_cache_reuse_advance_cursor(pieces_cache_prefix, cache_cur);
+
+        if (raw_prefix_cur.off == 0 && raw_prefix_cur.tok <= plan.raw_prefix_len) {
+            plan.raw_to_cache_prefix[raw_prefix_cur.tok] = cache_cur.tok;
+        }
+    }
+
+    server_cache_reuse_normalize_cursor(pieces_cache_prefix, cache_cur);
+    if (cache_cur.tok != pieces_cache_prefix.size() || cache_cur.off != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+bool server_cache_reuse_build_reasoning_compaction(
+        const struct llama_context * ctx,
+        const llama_tokens & tokens_old_raw,
+        const llama_tokens & tokens_old_cache,
+        const std::vector<size_t> & old_raw_to_cache_prefix,
+        const llama_tokens & tokens_new_raw,
+        const llama_tokens & reasoning_start,
+        const llama_tokens & reasoning_end,
+        server_cache_reuse_reasoning_compaction & plan) {
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    const auto pieces_old_raw = server_cache_reuse_token_pieces(ctx, tokens_old_raw);
+    const auto pieces_old_cache = server_cache_reuse_token_pieces(ctx, tokens_old_cache);
+    const auto pieces_new_raw = server_cache_reuse_token_pieces(ctx, tokens_new_raw);
+
+    return server_cache_reuse_build_reasoning_compaction_pieces(
+            tokens_old_raw,
+            pieces_old_raw,
+            tokens_old_cache,
+            pieces_old_cache,
+            old_raw_to_cache_prefix,
+            tokens_new_raw,
+            pieces_new_raw,
+            reasoning_start,
+            reasoning_end,
+            plan);
 }
 
 static size_t server_cache_reuse_find_first_ge(const std::vector<size_t> & values, const size_t target) {

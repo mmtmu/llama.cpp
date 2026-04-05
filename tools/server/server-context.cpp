@@ -147,7 +147,7 @@ struct server_slot {
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
-        prompt.tokens.clear();
+        prompt.clear_tokens();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -846,6 +846,7 @@ private:
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            slot.prompt.init_raw_identity();
 
             // try speculative decoding
             if (can_spec) {
@@ -1038,7 +1039,7 @@ private:
 
                 idle_slots.push_back(&slot);
                 candidates.push_back({
-                    &slot.prompt.tokens.get_text_tokens(),
+                    &slot.prompt.get_text_tokens_raw(),
                     slot.t_last_used,
                     slot.id,
                 });
@@ -1054,7 +1055,7 @@ private:
 
                 if (choice.sum_len > 0) {
                     float f_keep = 0.0f;
-                    const size_t size_old = ret->prompt.tokens.get_text_tokens().size();
+                    const size_t size_old = ret->prompt.n_tokens_raw();
                     if (size_old > 0) {
                         f_keep = (float) choice.sum_len / size_old;
                     }
@@ -1084,15 +1085,15 @@ private:
                     continue;
                 }
 
-                const auto & tokens = slot.prompt.tokens;
+                const auto & tokens = slot.prompt;
 
                 // skip the slot if it does not contains cached tokens
-                if (tokens.empty()) {
+                if (tokens.n_tokens_raw() == 0) {
                     continue;
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                const float sim_cur = float(tokens.get_common_prefix_raw(task.tokens)) / task.tokens.size();
 
                 // select the current slot if the criteria match
                 if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
@@ -1103,7 +1104,7 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                const float f_keep = ret->prompt.n_tokens_raw() > 0 ? (sim_best*task.tokens.size()) / ret->prompt.n_tokens_raw() : 0.0f;
 
                 SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                         sim_best, slot_prompt_similarity, f_keep);
@@ -1223,7 +1224,7 @@ private:
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_INF(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.prompt.tokens.clear();
+                    slot.prompt.clear_tokens();
                 } else {
                     SLT_INF(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -1562,7 +1563,7 @@ private:
             res->is_progress        = true;
             res->progress.total     = slot.task->n_tokens();
             res->progress.cache     = slot.n_prompt_tokens_cache;
-            res->progress.processed = slot.prompt.tokens.size();
+            res->progress.processed = slot.prompt.n_tokens_raw();
             res->progress.time_ms   = (ggml_time_us() - slot.t_start_process_prompt) / 1000;
         } else {
             res->content = tkn.text_to_send;
@@ -1998,13 +1999,14 @@ private:
                     size_t token_count = 0;
                     size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
-                        slot->prompt.tokens.clear(); // KV may already been invalidated?
+                        slot->prompt.clear_tokens(); // KV may already been invalidated?
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
+                    slot->prompt.sync_raw_with_cache_identity();
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2172,6 +2174,7 @@ private:
 
                     slot.prompt.tokens.clear();
                     slot.prompt.tokens.insert(new_tokens);
+                    slot.prompt.sync_raw_with_cache_identity();
                 }
 
                 slot.truncated = true;
@@ -2226,7 +2229,7 @@ private:
                 // add the sampled token to the batch
                 slot.i_batch_dft.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
-                slot.prompt.tokens.push_back(slot.sampled);
+                slot.prompt.push_back_text_token(slot.sampled);
 
                 if (slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
@@ -2242,7 +2245,7 @@ private:
                     for (size_t i = 0; i < draft.size(); i++) {
                         slot.i_batch_dft.push_back(batch.n_tokens);
                         common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
-                        slot.prompt.tokens.push_back(draft[i]);
+                        slot.prompt.push_back_text_token(draft[i]);
                     }
                     slot.drafted = std::move(draft);
                 }
@@ -2252,7 +2255,7 @@ private:
 
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
 
-                slot.prompt.tokens.push_back(slot.sampled);
+                slot.prompt.push_back_text_token(slot.sampled);
 
                 SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                         slot.n_ctx, slot.prompt.n_tokens(), slot.truncated);
@@ -2316,6 +2319,7 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        int n_past_cache = 0;
                         int n_cache_reuse = 0;
                         bool can_cache_reuse = false;
                         slot.cache_reuse.blocks.clear();
@@ -2375,21 +2379,61 @@ private:
                             }
 
                             if (slot.task->params.cache_prompt) {
+                                const bool is_text_only =
+                                        !slot.prompt.tokens.has_mtmd &&
+                                        !input_tokens.has_mtmd;
+
                                 // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                n_past = slot.prompt.get_common_prefix_raw(input_tokens);
+                                n_past_cache = (int) slot.prompt.cache_prefix_for_raw_prefix((size_t) n_past);
+
+                                if (is_text_only &&
+                                    n_past < (int) slot.prompt.n_tokens_raw() &&
+                                    !slot.task->params.sampling.reasoning_budget_start.empty() &&
+                                    !slot.task->params.sampling.reasoning_budget_end.empty()) {
+                                    server_cache_reuse_reasoning_compaction compact;
+                                    if (server_cache_reuse_build_reasoning_compaction(
+                                                ctx,
+                                                slot.prompt.get_text_tokens_raw(),
+                                                slot.prompt.tokens.get_text_tokens(),
+                                                slot.prompt.raw_to_cache_prefix,
+                                                input_tokens.get_text_tokens(),
+                                                slot.task->params.sampling.reasoning_budget_start,
+                                                slot.task->params.sampling.reasoning_budget_end,
+                                                compact) &&
+                                        compact.raw_prefix_len > (size_t) n_past) {
+                                        const auto & input_text_tokens = input_tokens.get_text_tokens();
+                                        llama_tokens raw_prefix(
+                                                input_text_tokens.begin(),
+                                                input_text_tokens.begin() + compact.raw_prefix_len);
+
+                                        slot.prompt.set_text_views(
+                                                compact.cache_prefix_tokens,
+                                                raw_prefix,
+                                                compact.raw_to_cache_prefix);
+                                        slot.prompt.checkpoints.clear();
+
+                                        n_past = (int) compact.raw_prefix_len;
+                                        n_past_cache = (int) compact.cache_prefix_tokens.size();
+
+                                        SLT_DBG(slot, "reasoning compaction reused prefix raw=%d cache=%d\n",
+                                                n_past, n_past_cache);
+                                    }
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
+                                    n_past_cache = (int) slot.prompt.cache_prefix_for_raw_prefix((size_t) n_past);
                                 }
 
                                 n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
-                                    !slot.prompt.tokens.has_mtmd &&
-                                    !input_tokens.has_mtmd;
+                                    is_text_only &&
+                                    slot.prompt.is_raw_cache_identity();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -2398,9 +2442,10 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                                n_past_cache = 0;
                             }
 
-                            llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+                            llama_pos pos_next = slot.prompt.tokens.pos_next(n_past_cache);
 
                             // note: when n_swa == 0, the model does not use SWA
                             const auto n_swa = std::max(0, llama_model_n_swa(model));
@@ -2408,10 +2453,10 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa);
 
-                            if (n_past > 0 && n_past < slot.prompt.n_tokens()) {
+                            if (n_past_cache > 0 && n_past_cache < slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
                                 if (pos_min == -1) {
-                                    SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
+                                    SLT_ERR(slot, "n_past_cache = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past_cache, (int) slot.prompt.tokens.size(), slot.id, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
@@ -2419,7 +2464,7 @@ private:
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
                                     const int np0 = std::max<int>(n_past - 4, 0);
-                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
+                                    const int np1 = std::min<int>(n_past + 6, std::min((int) slot.prompt.n_tokens_raw(), slot.task->n_tokens()));
 
                                     std::stringstream ss0;
                                     std::stringstream ss1;
@@ -2437,7 +2482,7 @@ private:
                                         }
 
                                         {
-                                            const auto token = slot.prompt.tokens[i];
+                                            const auto token = slot.prompt.get_text_tokens_raw()[i];
                                             const auto piece = token != LLAMA_TOKEN_NULL ? common_token_to_piece(ctx, token) : "[mtmd]";
                                             ss0 << piece;
                                             st0 << std::setw(8) << token;
@@ -2459,7 +2504,7 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
-                                    SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
+                                    SLT_WRN(slot, "n_past = %d, n_past_cache = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, n_past_cache, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
@@ -2486,8 +2531,9 @@ private:
                                             //printf("[DEBUG] `do_reset` was set to `true` after failing to restore a checkpoint");
                                         } else {
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                            n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
+                                            n_past_cache = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            n_past = std::min<int>(n_past, (int) n_past_cache);
+                                            SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, n_past_cache = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, n_past_cache, (float) checkpoint_size / 1024 / 1024);
                                         }
                                     }
 
@@ -2496,6 +2542,7 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        n_past_cache = 0;
                                     }
                                 }
                             }
@@ -2518,6 +2565,7 @@ private:
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
+                            n_past_cache = (int) slot.prompt.cache_prefix_for_raw_prefix((size_t) n_past);
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
@@ -2552,16 +2600,17 @@ private:
                             }
                         }
 
-                        slot.n_prompt_tokens_cache     = n_past;
+                        slot.n_prompt_tokens_cache     = n_past_cache;
                         slot.n_prompt_tokens_processed = 0;
 
-                        slot.prompt.tokens.keep_first(n_past);
+                        slot.prompt.tokens.keep_first(n_past_cache);
+                        slot.prompt.keep_first_raw(n_past);
 
                         if (slot.cache_reuse.active) {
                             if (!server_cache_reuse_prepare_memory(
                                     slot,
                                     ctx,
-                                    (size_t) n_past)) {
+                                    (size_t) n_past_cache)) {
                                 SLT_WRN(slot, "%s", "cache reuse memory preparation failed - clearing cache\n");
                                 slot.prompt_clear(true);
                                 slot.n_prompt_tokens_cache = 0;
@@ -2607,8 +2656,8 @@ private:
                     // tokens before the invocation sequence need to be
                     // processed without the adapter in a separate batch, then
                     // the adapter needs to be enabled for the remaining tokens.
-                    if (lora_all_alora(slot.lora) && slot.alora_invocation_start - 1 > slot.prompt.n_tokens()) {
-                        SLT_DBG(slot, "processing pre-alora tokens without the adapter (n_tokens = %d, alora_invocation_start = %d)\n", slot.prompt.n_tokens(), slot.alora_invocation_start);
+                    if (lora_all_alora(slot.lora) && slot.alora_invocation_start - 1 > (int) slot.prompt.n_tokens_raw()) {
+                        SLT_DBG(slot, "processing pre-alora tokens without the adapter (n_tokens_raw = %d, alora_invocation_start = %d)\n", (int) slot.prompt.n_tokens_raw(), slot.alora_invocation_start);
                         const auto & enabled_loras = lora_get_enabled_ids(slot.lora);
                         GGML_ASSERT(enabled_loras.size() == 1);
                         alora_scale = slot.lora[enabled_loras[0]].scale;
@@ -2636,10 +2685,10 @@ private:
                     bool has_mtmd = false;
 
                     // check if we should process the image
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                    while (slot.prompt.n_tokens_raw() < (size_t) slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens_raw()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens_raw(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -2651,7 +2700,7 @@ private:
 
                         // add the image chunk to cache
                         {
-                            const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());
+                            const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens_raw());
                             slot.prompt.tokens.push_back(chunk.get()); // copy
                         }
 
@@ -2659,7 +2708,7 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                    while (slot.prompt.n_tokens_raw() < (size_t) slot.task->n_tokens()) {
                         if (slot.cache_reuse.active && slot.cache_reuse.index < slot.cache_reuse.blocks.size()) {
                             const auto & block = slot.cache_reuse.blocks[slot.cache_reuse.index];
                             const size_t cur_pos = slot.prompt.n_tokens();
@@ -2687,7 +2736,7 @@ private:
 
                                 if (restored) {
                                     for (size_t i = 0; i < block.len; i++) {
-                                        slot.prompt.tokens.push_back(input_tokens[block.new_pos + i]);
+                                        slot.prompt.push_back_text_token(input_tokens[block.new_pos + i]);
                                     }
 
                                     slot.n_prompt_tokens_cache += (int32_t) block.len;
@@ -2712,7 +2761,7 @@ private:
                         }
 
                         // get next token to process
-                        llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+                        llama_token cur_tok = input_tokens[slot.prompt.n_tokens_raw()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break; // end of text chunk
                         }
@@ -2720,8 +2769,8 @@ private:
                         // if this is an alora request with pre-invocation
                         // tokens that are not cached, we need to stop filling
                         // this batch at those pre-invocation tokens.
-                        if (alora_scale > 0 && slot.prompt.n_tokens() == slot.alora_invocation_start - 1) {
-                            SLT_DBG(slot, "stop prompt batch filling at (n_tokens = %d, alora_invocation_start = %d)\n", slot.prompt.n_tokens(), slot.alora_invocation_start);
+                        if (alora_scale > 0 && (int) slot.prompt.n_tokens_raw() == slot.alora_invocation_start - 1) {
+                            SLT_DBG(slot, "stop prompt batch filling at (n_tokens_raw = %d, alora_invocation_start = %d)\n", (int) slot.prompt.n_tokens_raw(), slot.alora_invocation_start);
                             break;
                         }
 
@@ -2731,7 +2780,7 @@ private:
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
                             slot.task->need_embd());
-                        slot.prompt.tokens.push_back(cur_tok);
+                        slot.prompt.push_back_text_token(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
 
@@ -2746,7 +2795,7 @@ private:
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                if (slot.task->n_tokens() == (int) slot.prompt.n_tokens_raw() + n_last) {
                                     should_break = true;
                                     break;
                                 }
@@ -2761,7 +2810,7 @@ private:
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
                     // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                    if ((int) slot.prompt.n_tokens_raw() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.n_tokens > 0);
@@ -2773,9 +2822,9 @@ private:
                         slot.i_batch   = batch.n_tokens - 1;
 
                         slot.init_sampler();
-                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", (int) slot.prompt.n_tokens_raw(), batch.n_tokens);
                     } else {
-                        if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
+                        if (slot.task->n_tokens() < (int) slot.prompt.n_tokens_raw() + n_ubatch) {
                             // near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
                         } else {
@@ -2796,7 +2845,7 @@ private:
                             }
                         }
 
-                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
+                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", (int) slot.prompt.n_tokens_raw(), batch.n_tokens, (float) slot.prompt.n_tokens_raw() / slot.task->n_tokens());
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
@@ -3090,6 +3139,7 @@ private:
                     slot.drafted.clear();
                     // n_draft is still valid: rollback speculative tokens and clean up KV cache
                     slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+                    slot.prompt.keep_first_raw(slot.prompt.n_tokens_raw() - n_draft);
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
                     slot.release();
                     continue;
@@ -3111,9 +3161,10 @@ private:
 
                 // rollback to the state before sampling the draft tokens
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+                slot.prompt.keep_first_raw(slot.prompt.n_tokens_raw() - n_draft);
 
                 // add accepted tokens to the prompt
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+                slot.prompt.insert_text_tokens({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
                 llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
