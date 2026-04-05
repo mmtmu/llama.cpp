@@ -91,6 +91,18 @@ int main() {
         t.assert_true(plan.empty());
     });
 
+    t.test("reuse plan leaves one trailing token for logits", [](testing & t) {
+        llama_tokens old_tokens = { 1, 2, 3, 4, 5 };
+        llama_tokens new_tokens = { 1, 2, 3, 4, 5 };
+
+        auto plan = server_cache_reuse_build_plan(old_tokens, new_tokens, 0, 2, new_tokens.size());
+        t.assert_true(plan.size() == 1);
+        if (plan.size() != 1) {
+            return;
+        }
+        assert_block(t, plan[0], 0, 0, 4);
+    });
+
     t.test("mapped plan reuses islands across non-identity seams", [](testing & t) {
         const llama_tokens old_raw   = { 1, 367, 60, 2, 367, 70 };
         const llama_tokens old_cache = { 1, 10, 10, 60, 2, 10, 10, 70 };
@@ -120,6 +132,37 @@ int main() {
                 4,
                 { 2, 10, 10, 70 },
                 { 0, 1, 3, 4 });
+    });
+
+    t.test("mapped plan also leaves one trailing token for logits", [](testing & t) {
+        const llama_tokens old_raw   = { 1, 367, 60 };
+        const llama_tokens old_cache = { 1, 10, 10, 60 };
+        const std::vector<size_t> old_map = { 0, 1, 3, 4 };
+        const llama_tokens new_raw   = { 1, 367, 60 };
+
+        const auto plan = server_cache_reuse_build_mapped_plan(
+                old_raw,
+                old_cache,
+                old_map,
+                new_raw,
+                0,
+                2,
+                new_raw.size());
+
+        t.assert_true(plan.size() == 1);
+        if (plan.size() != 1) {
+            return;
+        }
+
+        assert_mapped_block(
+                t,
+                plan[0],
+                0,
+                0,
+                2,
+                0,
+                { 1, 10, 10 },
+                { 0, 1, 3 });
     });
 
     t.test("routing prefers larger island sum over better LCP", [](testing & t) {

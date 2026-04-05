@@ -651,6 +651,18 @@ std::vector<server_cache_reuse_block> server_cache_reuse_build_plan(
         }
     }
 
+    if (!plan.empty()) {
+        auto & last = plan.back();
+        if (last.new_pos + last.len == new_limit) {
+            if (last.len > 0) {
+                last.len--;
+            }
+            if (last.len == 0) {
+                plan.pop_back();
+            }
+        }
+    }
+
     return plan;
 }
 
