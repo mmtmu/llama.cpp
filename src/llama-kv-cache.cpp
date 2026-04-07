@@ -1959,9 +1959,16 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        // When online rotation (attn_rot_k) is active, the rotation mixes all
+        // n_embd_head_k dimensions. The view must cover the full head so that
+        // build_rope_shift can correctly undo the rotation before shifting RoPE
+        // and redo it after. Using only n_rot dimensions here would apply the
+        // rotation undo/redo to the wrong subset, corrupting ~60% of the values.
+        const auto n_view = attn_rot_k ? n_embd_head_k : n_rot;
+
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_view, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
