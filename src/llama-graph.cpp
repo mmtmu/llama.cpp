@@ -2288,9 +2288,9 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask_mla();
+    const auto & kq_mask_f32 = inp->self_kq_mask_mla;
 
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask_f32, -INFINITY);
     kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
             kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
 
@@ -2303,7 +2303,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k);
     kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3],
             kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask_f32);
+
+    if (cparams.flash_attn) {
+        kq_mask_top_k = ggml_cast(ctx0, kq_mask_top_k, GGML_TYPE_F16);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
