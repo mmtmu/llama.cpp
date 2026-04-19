@@ -6655,6 +6655,59 @@ struct test_diag : public test_case {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER
+struct test_lightning_indexer : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const ggml_type type_c;
+    const std::array<int64_t, 4> ne_a;
+    const std::array<int64_t, 4> ne_b;
+    const std::array<int64_t, 4> ne_c;
+    const float scale_embd;
+    const float scale_heads;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, type_b, type_c, ne_a, ne_b, ne_c, scale_embd, scale_heads);
+    }
+
+    test_lightning_indexer(
+            ggml_type type_a = GGML_TYPE_F32,
+            ggml_type type_b = GGML_TYPE_F16,
+            ggml_type type_c = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_a = {128, 32, 64, 1},
+            std::array<int64_t, 4> ne_b = {128, 1, 256, 1},
+            std::array<int64_t, 4> ne_c = {32, 64, 1, 1},
+            float scale_embd = 1.0f / sqrtf(float(128)),
+            float scale_heads = 1.0f / sqrtf(float(32)))
+        : type_a(type_a), type_b(type_b), type_c(type_c), ne_a(ne_a), ne_b(ne_b), ne_c(ne_c),
+          scale_embd(scale_embd), scale_heads(scale_heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type_a, 4, ne_a.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor(ctx, type_b, 4, ne_b.data());
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * c = ggml_new_tensor(ctx, type_c, 4, ne_c.data());
+        ggml_set_param(c);
+        ggml_set_name(c, "c");
+
+        ggml_tensor * out = ggml_lightning_indexer(ctx, a, b, c, scale_embd, scale_heads);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -8547,6 +8600,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F32, { 303, 207, 11, 3 }));
     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F32, { 800, 600, 4, 4 }));
     test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F32, { 2048, 512, 2, 2 }));
+    test_cases.emplace_back(new test_fill(0.0f, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F16, { 303, 207, 11, 3 }));
+    test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F16, { 800, 600, 4, 4 }));
+    test_cases.emplace_back(new test_fill(3.5f, GGML_TYPE_F16, { 2048, 512, 2, 2 }));
 
     test_cases.emplace_back(new test_diag());
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 79, 1, 19, 13 }));
@@ -8721,6 +8778,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_falcon(1));
     test_cases.emplace_back(new test_falcon(2));
 #endif
+
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16,  GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q5_0, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q5_1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F32));
 
     return test_cases;
 }
@@ -8996,6 +9061,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_F16,  GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q5_0, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q5_1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F32));
 
     return test_cases;
 }

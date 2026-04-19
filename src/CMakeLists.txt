@@ -21,6 +21,7 @@ add_library(llama
             llama-impl.cpp
             llama-io.cpp
             llama-kv-cache.cpp
+            llama-kv-cache-dsa.cpp
             llama-kv-cache-iswa.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
@@ -57,6 +58,7 @@ add_library(llama
             models/deci.cpp
             models/deepseek.cpp
             models/deepseek2.cpp
+            models/glm-dsa.cpp
             models/delta-net-base.cpp
             models/dots1.cpp
             models/dream.cpp

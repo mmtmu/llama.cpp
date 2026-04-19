@@ -2232,8 +2232,42 @@ static void ggml_compute_forward_fill_f32(const ggml_compute_params * params, gg
     }
 }
 
+static void ggml_compute_forward_fill_f16(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_fp16_t c = GGML_CPU_FP32_TO_FP16(ggml_get_op_params_f32(dst, 0));
+
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
+    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
+
+    const auto [ir0, ir1] = get_thread_range(params, dst);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne2*ne1);
+        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
+        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
+
+        ggml_fp16_t * dst_ptr = (ggml_fp16_t *) ((char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1);
+
+        ggml_vec_set_f16(ne0, dst_ptr, c);
+    }
+}
+
 void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor * dst) {
-    ggml_compute_forward_fill_f32(params, dst);
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fill_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_fill_f16(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("unsupported type for ggml_compute_forward_fill: %s", ggml_type_name(src0->type));
+            }
+    }
 }
 
 // ggml_compute_tri
@@ -10605,6 +10639,71 @@ void ggml_compute_forward_gated_delta_net(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+void ggml_compute_forward_lightning_indexer(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+
+    const float scale_embd  = ggml_get_op_params_f32(dst, 0);
+    const float scale_heads = ggml_get_op_params_f32(dst, 1);
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_TERNARY_OP_LOCALS
+
+    GGML_ASSERT(nb0  == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float));
+
+    const int n_embd   = src0->ne[0];
+    const int n_head   = src0->ne[1];
+    const int n_batch  = src0->ne[2];
+    const int n_stream = src0->ne[3];
+    const int n_kv     = src1->ne[2];
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(src1->type)->to_float;
+    GGML_ASSERT((src1->type == GGML_TYPE_F32 || k_to_float) && "lightning indexer: unsupported K-type");
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * src1_row_f32 = (float *) params->wdata + ith*(n_embd + CACHE_LINE_SIZE_F32);
+
+    const int dr  = (n_kv + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, n_kv);
+
+    for (int i_stream = 0; i_stream < n_stream; ++i_stream) {
+        for (int i_batch = 0; i_batch < n_batch; ++i_batch) {
+            float * src2_row = (float *) ((char *) src2->data + i_batch*nb21 + i_stream*nb23);
+            float * dst_row  = (float *) ((char *) dst->data  + i_batch*nb1  + i_stream*nb3);
+
+            for (int i_kv = ir0; i_kv < ir1; ++i_kv) {
+                char * src1_row = (char *) src1->data + i_kv*nb12 + i_stream*nb13;
+                if (k_to_float) {
+                    k_to_float(src1_row, src1_row_f32, n_embd);
+                } else {
+                    src1_row_f32 = (float *) src1_row;
+                }
+
+                float score = 0.0f;
+                for (int i_head = 0; i_head < n_head; ++i_head) {
+                    float qk = 0.0f;
+                    float * src0_row = (float *) ((char *) src0->data + i_head*nb01 + i_batch*nb02 + i_stream*nb03);
+                    ggml_vec_dot_f32(n_embd, &qk, 0, src0_row, 0, src1_row_f32, 0, 1);
+                    qk *= scale_embd;
+                    score += MAX(qk, 0.0f) * src2_row[i_head];
+                }
+
+                dst_row[i_kv] = score * scale_heads;
+            }
+        }
     }
 }
 
