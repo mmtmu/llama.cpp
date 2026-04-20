@@ -44,22 +44,27 @@ llm_build_glm_dsa::llm_build_glm_dsa(const llama_model & model, const llm_graph_
             ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
             cb(indexer_q, "indexer_q", il);
 
-            ggml_tensor * indexer_q_nope = ggml_view_3d(
-                    ctx0, indexer_q, n_embd_indexer_head_nope, n_indexer_head, n_tokens,
-                    ggml_row_size(indexer_q->type, n_embd_indexer_head),
-                    ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head,
-                    0);
+            // Indexer per-head layout is [rope_dim | nope_dim] — pe occupies the low half.
+            // Reference: DeepSeek-V3.2-Exp inference/model.py and HF modeling_glm_moe_dsa.py
+            //   q_pe, q_nope = torch.split(q, [rope_head_dim, head_dim - rope_head_dim], dim=-1)
+            //   q_pe = apply_rotary_emb(q_pe)
+            //   q = torch.cat([q_pe, q_nope], dim=-1)
             ggml_tensor * indexer_q_pe = ggml_view_3d(
                     ctx0, indexer_q, n_embd_indexer_head_rope, n_indexer_head, n_tokens,
                     ggml_row_size(indexer_q->type, n_embd_indexer_head),
                     ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head,
-                    ggml_row_size(indexer_q->type, n_embd_indexer_head_nope));
+                    0);
+            ggml_tensor * indexer_q_nope = ggml_view_3d(
+                    ctx0, indexer_q, n_embd_indexer_head_nope, n_indexer_head, n_tokens,
+                    ggml_row_size(indexer_q->type, n_embd_indexer_head),
+                    ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head,
+                    ggml_row_size(indexer_q->type, n_embd_indexer_head_rope));
 
             indexer_q_pe = ggml_rope_ext(ctx0, indexer_q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
             cb(indexer_q_pe, "indexer_q_pe", il);
 
-            indexer_q = ggml_concat(ctx0, indexer_q_nope, indexer_q_pe, 0);
+            indexer_q = ggml_concat(ctx0, indexer_q_pe, indexer_q_nope, 0);
             cb(indexer_q, "indexer_q", il);
 
             ggml_tensor * indexer_k = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_k, cur);
@@ -68,22 +73,22 @@ llm_build_glm_dsa::llm_build_glm_dsa(const llama_model & model, const llm_graph_
             indexer_k = build_norm(indexer_k, model.layers[il].indexer_k_norm, model.layers[il].indexer_k_norm_b, LLM_NORM, il);
             cb(indexer_k, "indexer_k", il);
 
-            ggml_tensor * indexer_k_nope = ggml_view_3d(
-                    ctx0, indexer_k, n_embd_indexer_head_nope, 1, n_tokens,
-                    ggml_row_size(indexer_k->type, n_embd_indexer_head),
-                    ggml_row_size(indexer_k->type, n_embd_indexer_head),
-                    0);
             ggml_tensor * indexer_k_pe = ggml_view_3d(
                     ctx0, indexer_k, n_embd_indexer_head_rope, 1, n_tokens,
                     ggml_row_size(indexer_k->type, n_embd_indexer_head),
                     ggml_row_size(indexer_k->type, n_embd_indexer_head),
-                    ggml_row_size(indexer_k->type, n_embd_indexer_head_nope));
+                    0);
+            ggml_tensor * indexer_k_nope = ggml_view_3d(
+                    ctx0, indexer_k, n_embd_indexer_head_nope, 1, n_tokens,
+                    ggml_row_size(indexer_k->type, n_embd_indexer_head),
+                    ggml_row_size(indexer_k->type, n_embd_indexer_head),
+                    ggml_row_size(indexer_k->type, n_embd_indexer_head_rope));
 
             indexer_k_pe = ggml_rope_ext(ctx0, indexer_k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
             cb(indexer_k_pe, "indexer_k_pe", il);
 
-            indexer_k = ggml_concat(ctx0, indexer_k_nope, indexer_k_pe, 0);
+            indexer_k = ggml_concat(ctx0, indexer_k_pe, indexer_k_nope, 0);
             cb(indexer_k, "indexer_k", il);
 
             indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
