@@ -281,12 +281,6 @@ llama_kv_cache::llama_kv_cache(
         !hparams.is_n_embd_k_gqa_variable() &&
         hparams.n_embd_head_k() % 64 == 0;
 
-    if ((model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DEEPSEEK2) &&
-        hparams.n_embd_head_k_full == hparams.indexer_head_size &&
-        hparams.indexer_head_size > 0) {
-        attn_rot_k = true;
-    }
-
     attn_rot_v =
         !attn_rot_disable &&
         ggml_is_quantized(type_v) &&

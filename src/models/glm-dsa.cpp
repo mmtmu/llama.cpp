@@ -91,8 +91,17 @@ llm_build_glm_dsa::llm_build_glm_dsa(const llama_model & model, const llm_graph_
             indexer_k = ggml_concat(ctx0, indexer_k_pe, indexer_k_nope, 0);
             cb(indexer_k, "indexer_k", il);
 
-            indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
-            indexer_k = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_k);
+            // Online Hadamard rotation (PR #21038) — only built when the lid cache is quantized.
+            // Note on direction: ggml_mul_mat(A, B) contracts on dim 0, i.e. computes Aᵀ·B,
+            // so these calls apply Hᵀ to q and k. That is safe because ggml_gen_hadamard
+            // returns a symmetric orthogonal matrix (H = Hᵀ, H² = I), so Hᵀx and Hx are the
+            // same tensor — the direction cannot mismatch with the cache's internal k-shift
+            // path. If the rotation is ever swapped for a non-symmetric orthogonal matrix,
+            // both sites must agree on H vs Hᵀ.
+            if (inp_attn_dsa->self_k_rot_lid) {
+                indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
+                indexer_k = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_k);
+            }
 
             const auto * mctx_lid = inp_attn_dsa->mctx->get_lid();
             const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
